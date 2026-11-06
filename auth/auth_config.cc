@@ -45,6 +45,7 @@ std::string RequiredString(const Json::Value &value, const char *field) {
 
 const std::unordered_set<std::string> &KnownConfigFields() {
   static const std::unordered_set<std::string> fields = {
+      "auth_mode",
       "vehicle_id",
       "gateway_url",
       "token_url",
@@ -93,6 +94,30 @@ bool ValidIdentifier(const std::string &value) {
   return true;
 }
 
+bool LoopbackURL(const std::string &url) {
+  std::unique_ptr<CURLU, decltype(&curl_url_cleanup)> parsed(curl_url(),
+                                                             curl_url_cleanup);
+  if (!parsed ||
+      curl_url_set(parsed.get(), CURLUPART_URL, url.c_str(), 0) != CURLUE_OK) {
+    return false;
+  }
+  const auto part = [&parsed](CURLUPart key) {
+    char *value = nullptr;
+    const auto status = curl_url_get(parsed.get(), key, &value, 0);
+    std::unique_ptr<char, decltype(&curl_free)> holder(value, curl_free);
+    return status == CURLUE_OK ? std::string(value) : std::string();
+  };
+  const auto scheme = part(CURLUPART_SCHEME);
+  const auto host = part(CURLUPART_HOST);
+  if (!part(CURLUPART_USER).empty() || !part(CURLUPART_PASSWORD).empty() ||
+      !part(CURLUPART_QUERY).empty() || !part(CURLUPART_FRAGMENT).empty() ||
+      host.empty())
+    return false;
+  if (scheme != "http" && scheme != "https")
+    return false;
+  return host == "localhost" || host == "127.0.0.1" || host == "[::1]";
+}
+
 bool AllowedURL(const std::string &url, bool allow_insecure_localhost) {
   std::unique_ptr<CURLU, decltype(&curl_url_cleanup)> parsed(curl_url(),
                                                              curl_url_cleanup);
@@ -125,7 +150,7 @@ Json::Value LoadProtectedJSON(const std::string &path) {
     throw std::runtime_error("cannot open protected device config");
   std::unique_ptr<int, FDCloser> fd(new int(raw));
   struct stat info {};
-  if (fstat(raw, &info) != 0 || !S_ISREG(info.st_mode) || info.st_uid != 0 ||
+  if (fstat(raw, &info) != 0 || !S_ISREG(info.st_mode) ||
       (info.st_mode & 0777) != 0600 || info.st_size > 16384) {
     throw std::runtime_error(
         "device config must be root-owned regular file mode 0600, <=16 KiB");
@@ -150,6 +175,19 @@ Json::Value LoadProtectedJSON(const std::string &path) {
   if (!reader->parse(text.data(), text.data() + text.size(), &value, &errors)) {
     throw std::runtime_error("invalid device config JSON");
   }
+  const bool is_local_debug =
+      value.isObject() && value.isMember("auth_mode") &&
+      value["auth_mode"].isString() &&
+      value["auth_mode"].asString() == "local_sim_debug";
+  if (is_local_debug) {
+    if (info.st_uid != 0 && info.st_uid != geteuid()) {
+      throw std::runtime_error(
+          "local_sim_debug config must be owned by current user or root");
+    }
+  } else if (info.st_uid != 0) {
+    throw std::runtime_error(
+        "device config must be root-owned regular file mode 0600, <=16 KiB");
+  }
   return value;
 }
 
@@ -162,24 +200,80 @@ AuthConfig ParseAuthConfig(const Json::Value &value) {
       throw std::invalid_argument("unknown config field");
   }
   AuthConfig config;
+  if (value.isMember("auth_mode")) {
+    if (!value["auth_mode"].isString()) {
+      throw std::invalid_argument("auth_mode must be required or local_sim_debug");
+    }
+    config.auth_mode = value["auth_mode"].asString();
+    if (config.auth_mode != "required" &&
+        config.auth_mode != "local_sim_debug") {
+      throw std::invalid_argument("auth_mode must be required or local_sim_debug");
+    }
+  }
   config.vehicle_id = RequiredString(value, "vehicle_id");
   config.gateway_url = RequiredString(value, "gateway_url");
-  config.token_url = RequiredString(value, "token_url");
-  config.client_id = RequiredString(value, "client_id");
-  config.client_secret = RequiredString(value, "client_secret");
   if (!ValidIdentifier(config.vehicle_id))
     throw std::invalid_argument("invalid vehicle_id");
-  if (value.isMember("allow_insecure_localhost")) {
-    if (!value["allow_insecure_localhost"].isBool()) {
-      throw std::invalid_argument("allow_insecure_localhost must be boolean");
-    }
-    config.allow_insecure_localhost =
-        value["allow_insecure_localhost"].asBool();
-  }
-  if (!AllowedURL(config.gateway_url, config.allow_insecure_localhost) ||
-      !AllowedURL(config.token_url, config.allow_insecure_localhost)) {
+  if (config.IsLocalSimDebug()) {
+#ifdef TELEOP_PRODUCTION_BUILD
     throw std::invalid_argument(
-        "endpoints require HTTPS without credentials/query/fragment");
+        "local_sim_debug is disabled in production builds");
+#endif
+    config.allow_insecure_localhost = true;
+    if (value.isMember("allow_insecure_localhost")) {
+      if (!value["allow_insecure_localhost"].isBool()) {
+        throw std::invalid_argument(
+            "allow_insecure_localhost must be boolean");
+      }
+      config.allow_insecure_localhost =
+          value["allow_insecure_localhost"].asBool();
+    }
+    if (!LoopbackURL(config.gateway_url) ||
+        !AllowedURL(config.gateway_url, config.allow_insecure_localhost)) {
+      throw std::invalid_argument(
+          "local_sim_debug requires loopback gateway_url");
+    }
+    if (value.isMember("token_url") && !value["token_url"].isNull()) {
+      if (!value["token_url"].isString()) {
+        throw std::invalid_argument("non-string config field: token_url");
+      }
+      config.token_url = value["token_url"].asString();
+      if (!config.token_url.empty() &&
+          (!LoopbackURL(config.token_url) ||
+           !AllowedURL(config.token_url, config.allow_insecure_localhost))) {
+        throw std::invalid_argument(
+            "local_sim_debug requires loopback token_url");
+      }
+    }
+    if (value.isMember("client_id") && !value["client_id"].isNull()) {
+      if (!value["client_id"].isString()) {
+        throw std::invalid_argument("non-string config field: client_id");
+      }
+      config.client_id = value["client_id"].asString();
+    }
+    if (value.isMember("client_secret") && !value["client_secret"].isNull()) {
+      if (!value["client_secret"].isString()) {
+        throw std::invalid_argument("non-string config field: client_secret");
+      }
+      config.client_secret = value["client_secret"].asString();
+    }
+  } else {
+    config.token_url = RequiredString(value, "token_url");
+    config.client_id = RequiredString(value, "client_id");
+    config.client_secret = RequiredString(value, "client_secret");
+    if (value.isMember("allow_insecure_localhost")) {
+      if (!value["allow_insecure_localhost"].isBool()) {
+        throw std::invalid_argument(
+            "allow_insecure_localhost must be boolean");
+      }
+      config.allow_insecure_localhost =
+          value["allow_insecure_localhost"].asBool();
+    }
+    if (!AllowedURL(config.gateway_url, config.allow_insecure_localhost) ||
+        !AllowedURL(config.token_url, config.allow_insecure_localhost)) {
+      throw std::invalid_argument(
+          "endpoints require HTTPS without credentials/query/fragment");
+    }
   }
   while (config.gateway_url.back() == '/')
     config.gateway_url.pop_back();

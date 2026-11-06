@@ -21,15 +21,21 @@
 namespace vehicle_edge {
 
 struct AuthConfig {
+  std::string auth_mode = "required";
   std::string vehicle_id;
   std::string gateway_url;
   std::string token_url;
   std::string client_id;
   std::string client_secret;
   bool allow_insecure_localhost = false;
+
+  bool IsLocalSimDebug() const noexcept {
+    return auth_mode == "local_sim_debug";
+  }
 };
 
 bool ValidIdentifier(const std::string &value);
+bool LoopbackURL(const std::string &url);
 bool AllowedURL(const std::string &url, bool allow_insecure_localhost);
 Json::Value LoadProtectedJSON(const std::string &path);
 AuthConfig ParseAuthConfig(const Json::Value &value);

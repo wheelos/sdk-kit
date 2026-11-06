@@ -531,6 +531,92 @@ void InvalidRequestIDIsDiscarded() {
   }
 }
 
+class UserConfigFile {
+public:
+  explicit UserConfigFile(const std::string &contents) {
+    path_ =
+        "/tmp/vehicle_local_debug_" + std::to_string(getpid()) + ".json";
+    unlink(path_.c_str());
+    const int fd =
+        open(path_.c_str(), O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0600);
+    if (fd < 0)
+      throw std::runtime_error("could not create user debug config");
+    std::size_t written = 0;
+    while (written < contents.size()) {
+      const auto count =
+          write(fd, contents.data() + written, contents.size() - written);
+      if (count <= 0) {
+        close(fd);
+        unlink(path_.c_str());
+        throw std::runtime_error("could not write user debug config");
+      }
+      written += static_cast<std::size_t>(count);
+    }
+    if (fchmod(fd, 0600) != 0) {
+      close(fd);
+      unlink(path_.c_str());
+      throw std::runtime_error("could not chmod user debug config");
+    }
+    close(fd);
+  }
+
+  ~UserConfigFile() { unlink(path_.c_str()); }
+
+  const std::string &path() const { return path_; }
+
+private:
+  std::string path_;
+};
+
+void LocalSimDebugAuthAndProtectedFile() {
+  LocalHTTPServer server(
+      {{200, R"({"Name":"car-a","Roles":["vehicle","teleop:vehicle"]})",
+        "debug-identity-1", ""},
+       {204, "", "debug-mapping-2", ""},
+       {200, R"({"token":"synthetic-livekit-token"})", "debug-token-3", ""}});
+  Json::Value debug_json(Json::objectValue);
+  debug_json["auth_mode"] = "local_sim_debug";
+  debug_json["vehicle_id"] = "car-a";
+  debug_json["gateway_url"] = server.URL();
+  Json::StreamWriterBuilder writer;
+  writer["indentation"] = "";
+  UserConfigFile debug_file(Json::writeString(writer, debug_json));
+  const auto report =
+      vehicle_edge::RunVehicleAuthDiagnostic(debug_file.path());
+  server.Finish();
+  Require(report.passed && report.stages.size() == 5,
+          "local_sim_debug file diagnostic did not pass all 5 stages");
+  Require(server.requests().size() == 3,
+          "local_sim_debug made an unexpected OAuth network request");
+  Require(server.requests()[0].find(
+              "Authorization: Bearer car-a|vehicle|vehicle,teleop:vehicle") !=
+              std::string::npos,
+          "local_sim_debug did not synthesize expected Gateway dev token");
+
+  Json::Value remote_debug = debug_json;
+  remote_debug["gateway_url"] = "https://gateway.example.com";
+  bool rejected_remote = false;
+  try {
+    (void)vehicle_edge::ParseAuthConfig(remote_debug);
+  } catch (const std::invalid_argument &) {
+    rejected_remote = true;
+  }
+  Require(rejected_remote,
+          "local_sim_debug accepted non-loopback gateway_url");
+
+  if (geteuid() != 0) {
+    UserConfigFile non_root_prod(ConfigJSON("https://gateway.example.com"));
+    bool rejected_non_root = false;
+    try {
+      (void)vehicle_edge::LoadAuthConfig(non_root_prod.path());
+    } catch (const std::runtime_error &) {
+      rejected_non_root = true;
+    }
+    Require(rejected_non_root,
+            "required auth_mode accepted non-root config file");
+  }
+}
+
 void InterimHeadersAndNewGatewayCodesAreHandled() {
   LocalHTTPServer server(
       {{200, "{}", "final-request-id", "", "interim-request-id",
@@ -565,6 +651,7 @@ int main() {
     TransportFailuresRemainAtObservedStage();
     ExpiredTokenRefreshKeepsOAuthFailureAtRequestStage();
     InvalidRequestIDIsDiscarded();
+    LocalSimDebugAuthAndProtectedFile();
     InterimHeadersAndNewGatewayCodesAreHandled();
   } catch (const std::exception &error) {
     std::cerr << error.what() << '\n';

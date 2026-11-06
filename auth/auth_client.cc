@@ -43,6 +43,19 @@ SharedTokenProvider::SharedTokenProvider(AuthConfig config)
 
 std::string SharedTokenProvider::GetToken() {
   std::lock_guard<std::mutex> lock(mutex_);
+  if (config_.IsLocalSimDebug()) {
+    if (!LoopbackURL(config_.gateway_url)) {
+      throw AuthClientError("local_debug_non_loopback",
+                            "local_sim_debug requires a loopback gateway_url");
+    }
+    if (!ValidIdentifier(config_.vehicle_id)) {
+      throw AuthClientError("local_debug_invalid_vehicle",
+                            "local_sim_debug requires a valid vehicle_id");
+    }
+    token_ = config_.vehicle_id + "|vehicle|vehicle,teleop:vehicle";
+    expires_at_ = std::chrono::steady_clock::now() + std::chrono::hours(24);
+    return token_;
+  }
   if (token_.empty() || std::chrono::steady_clock::now() >= expires_at_) {
     AcquireLocked();
   }
@@ -113,6 +126,10 @@ void AuthenticatedClient::AcquireToken() {
 
 HTTPResponse AuthenticatedClient::Get(const std::string &path) {
   ValidateAPIPath(path);
+  if (config_.IsLocalSimDebug() && !LoopbackURL(config_.gateway_url)) {
+    throw std::invalid_argument(
+        "local_sim_debug requires loopback gateway_url");
+  }
   const auto token = token_provider_->GetToken();
   auto response = http_.Get(config_.gateway_url + path, token,
                             config_.allow_insecure_localhost);
@@ -125,6 +142,10 @@ HTTPResponse AuthenticatedClient::Get(const std::string &path) {
 HTTPResponse AuthenticatedClient::Post(const std::string &path,
                                        const std::string &body) {
   ValidateAPIPath(path);
+  if (config_.IsLocalSimDebug() && !LoopbackURL(config_.gateway_url)) {
+    throw std::invalid_argument(
+        "local_sim_debug requires loopback gateway_url");
+  }
   if (body.size() > 65536) {
     throw std::invalid_argument("device request body exceeds 64 KiB");
   }

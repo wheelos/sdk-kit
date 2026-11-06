@@ -102,11 +102,24 @@ MediaWorkerConfig ParseMediaWorkerConfig(const Json::Value &root) {
       config.control_mode != "simulation" && config.control_mode != "cyber") {
     throw std::invalid_argument("invalid control_mode");
   }
+  if (config.IsLocalSimDebug() && config.control_mode == "cyber") {
+    throw std::invalid_argument("local_sim_debug forbids cyber control_mode");
+  }
   if (config.media_enabled) {
     if (config.camera_source == "disabled" ||
         !ValidEndpointScheme(config.livekit_url, "ws://", "wss://")) {
       throw std::invalid_argument(
           "media requires livekit_url and active camera_source");
+    }
+    const auto endpoint =
+        config.livekit_url.rfind("wss://", 0) == 0
+            ? "https://" + config.livekit_url.substr(6)
+            : (config.livekit_url.rfind("ws://", 0) == 0
+                   ? "http://" + config.livekit_url.substr(5)
+                   : "");
+    if (config.IsLocalSimDebug() && !LoopbackURL(endpoint)) {
+      throw std::invalid_argument(
+          "local_sim_debug requires loopback livekit_url");
     }
   }
   return config;
