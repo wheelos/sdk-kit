@@ -1,0 +1,55 @@
+load("@rules_cc//cc:defs.bzl", "cc_binary", "cc_library")
+
+package(default_visibility = ["//visibility:public"])
+
+cc_library(
+    name = "encoded_video",
+    srcs = ["encoded_video.cc"],
+    hdrs = ["include/vehicle_edge/encoded_video.h"],
+    includes = ["include"],
+    linkopts = ["-pthread"],
+    deps = [
+        "//auth:vehicle_auth_sdk",
+        "@jsoncpp//:jsoncpp",
+    ],
+)
+
+cc_library(
+    name = "worker_runtime",
+    srcs = ["media_backend.cc"],
+    hdrs = ["include/vehicle_edge/media_backend.h"],
+    includes = ["include"],
+    linkopts = ["-pthread"],
+    target_compatible_with = [
+        "@platforms//cpu:x86_64",
+        "@platforms//os:linux",
+    ],
+    deps = [
+        ":encoded_video",
+        "//auth:vehicle_auth_sdk",
+        "@jsoncpp//:jsoncpp",
+        "@livekit_sdk//:livekit_sdk",
+    ],
+)
+
+cc_binary(
+    name = "vehicle_media_worker",
+    srcs = ["media_worker.cc"],
+    target_compatible_with = [
+        "@platforms//cpu:x86_64",
+        "@platforms//os:linux",
+    ],
+    deps = [
+        ":worker_runtime",
+        "@livekit_sdk//:livekit_sdk",
+    ],
+)
+
+filegroup(
+    name = "runtime_files",
+    srcs = [
+        ":vehicle_media_worker",
+        "@livekit_sdk//:runtime_libs",
+    ],
+)
+

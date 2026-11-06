@@ -1,0 +1,64 @@
+load("@rules_cc//cc:defs.bzl", "cc_binary", "cc_library")
+
+package(default_visibility = ["//visibility:public"])
+
+cc_library(
+    name = "curl_sys",
+    linkopts = [
+        "-lcurl",
+        "-pthread",
+    ],
+    visibility = ["//visibility:private"],
+)
+
+cc_library(
+    name = "vehicle_auth_sdk",
+    srcs = [
+        "auth_client.cc",
+        "auth_config.cc",
+        "http_client.cc",
+    ],
+    hdrs = [
+        "include/vehicle_edge/auth_client.h",
+        "include/vehicle_edge/auth_config.h",
+        "include/vehicle_edge/http_client.h",
+    ],
+    includes = ["include"],
+    linkopts = [
+        "-lcurl",
+        "-pthread",
+    ],
+    deps = [
+        ":curl_sys",
+        "@jsoncpp//:jsoncpp",
+    ],
+)
+
+alias(
+    name = "auth",
+    actual = ":vehicle_auth_sdk",
+)
+
+cc_library(
+    name = "auth_diagnostics",
+    srcs = [
+        "vehicle_auth_diagnostics.cc",
+    ],
+    hdrs = [
+        "include/vehicle_edge/diagnostics.h",
+    ],
+    includes = ["include"],
+    deps = [
+        ":vehicle_auth_sdk",
+    ],
+)
+
+cc_binary(
+    name = "vehicle_auth_check",
+    srcs = [
+        "vehicle_auth_check.cc",
+    ],
+    deps = [
+        ":auth_diagnostics",
+    ],
+)

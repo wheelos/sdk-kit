@@ -1,0 +1,6 @@
+.cache
+build
+bazel-bin
+bazel-out
+bazel-sdk-kit
+bazel-testlogs

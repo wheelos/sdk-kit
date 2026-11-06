@@ -1,0 +1,16 @@
+load("@rules_cc//cc:defs.bzl", "cc_test")
+
+package(default_visibility = ["//visibility:public"])
+
+cc_test(
+    name = "auth_diagnostics_test",
+    srcs = ["auth_diagnostics_test.cc"],
+    deps = ["//auth:auth_diagnostics"],
+)
+
+cc_test(
+    name = "encoded_video_test",
+    srcs = ["encoded_video_test.cc"],
+    deps = ["//livekit:encoded_video"],
+)
+

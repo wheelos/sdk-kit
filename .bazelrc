@@ -1,0 +1,13 @@
+common --color=yes
+common --enable_bzlmod
+common --lockfile_mode=off
+common --registry=https://bcr.wheelos.cn/
+common --registry=https://bcr.bazel.build/
+common --registry=file://%workspace%/../bazel-central-registry
+
+build --cxxopt=-std=c++17
+build --host_cxxopt=-std=c++17
+build --experimental_convenience_symlinks=ignore
+test --test_output=errors
+
+try-import %workspace%/.bazelrc.user
