@@ -281,6 +281,9 @@ void SuccessAndCompatibility() {
   const auto report =
       vehicle_edge::RunVehicleAuthDiagnostic(Config(server.URL()));
   server.Finish();
+  Require(server.requests()[0].find("&scope=teleop%3Avehicle") !=
+              std::string::npos,
+          "vehicle OAuth diagnostic grant omitted its required scope");
   Require(report.passed && report.stages.size() == 4 &&
               report.stages[0].name == "oauth_token_acquisition" &&
               report.stages[1].name == "gateway_identity" &&

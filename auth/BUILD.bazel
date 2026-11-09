@@ -62,3 +62,23 @@ cc_binary(
         ":auth_diagnostics",
     ],
 )
+
+cc_library(
+    name = "bootstrap",
+    srcs = [
+        "bootstrap.cc",
+        "bootstrap_crypto.cc",
+        "bootstrap_http.cc",
+        "bootstrap_storage.cc",
+    ],
+    hdrs = ["include/vehicle_edge/bootstrap.h"],
+    includes = ["include"],
+    linkopts = ["-lcrypto"],
+    deps = [":vehicle_auth_sdk"],
+)
+
+cc_binary(
+    name = "vehicle_bootstrap",
+    srcs = ["vehicle_bootstrap.cc"],
+    deps = [":bootstrap"],
+)

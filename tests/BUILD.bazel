@@ -9,6 +9,12 @@ cc_test(
 )
 
 cc_test(
+    name = "bootstrap_test",
+    srcs = ["bootstrap_test.cc"],
+    deps = ["//auth:bootstrap"],
+)
+
+cc_test(
     name = "encoded_video_test",
     srcs = ["encoded_video_test.cc"],
     deps = ["//livekit:encoded_video"],

@@ -55,6 +55,7 @@ class SharedTokenProvider {
 
   AuthConfig config_;
   std::mutex mutex_;
+  HTTPClient http_;
   std::string token_;
   std::chrono::steady_clock::time_point expires_at_{};
 };
