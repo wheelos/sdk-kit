@@ -59,6 +59,7 @@ const std::unordered_set<std::string> &KnownConfigFields() {
       "livekit_url",
       "media_worker_path",
       "camera_source",
+      "camera_capture_config",
       "control_mode",
       "control_channel",
       "camera_track",
