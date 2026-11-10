@@ -212,9 +212,8 @@ Bootstrap::Bootstrap(Json::Value config, Hooks hooks, Storage storage)
     while (url.back() == '/') url.pop_back();
     config_[field] = url;
   }
-  Text(config_, "name", 200);
-  Text(config_, "serial", 128, true);
-  Text(config_, "platform", 128, true);
+  // Vehicle metadata is assigned by the administrator. Legacy configuration
+  // fields may remain on disk, but new enrollments do not use them.
   for (const auto* field :
        {"state_directory", "device_template", "device_config"})
     Text(config_, field, 4096);
@@ -281,9 +280,6 @@ void Bootstrap::NewEnrollment() {
   state_ = Json::Value(Json::objectValue);
   state_["request_id"] = UUID();
   state_["public_key"] = PublicKey(private_key_);
-  state_["name"] = config_["name"];
-  state_["serial"] = config_["serial"];
-  state_["platform"] = config_["platform"];
   state_["status"] = "creating";
   state_["stage"] = "enroll_create";
   last_diagnostic_key_.clear();
@@ -356,8 +352,14 @@ Response Bootstrap::Enrollment(const std::string& action) {
   Json::Value envelope(Json::objectValue);
   envelope["request_id"] = state_["request_id"];
   envelope["public_key"] = PublicKey(private_key_);
-  for (const auto* field : {"name", "serial", "platform"})
-    envelope[field] = action == "create" ? state_[field] : Json::Value("");
+  // Preserve signed metadata only when retrying a pre-upgrade create request.
+  // Dropping it for that request ID would break server-side idempotency.
+  if (action == "create") {
+    for (const auto* field : {"name", "serial", "platform"})
+      if (state_.isMember(field))
+        envelope[field] = Text(state_, field,
+                               std::string(field) == "name" ? 200 : 128, true);
+  }
   envelope["device_code"] =
       action == "create" ? "" : state_.get("device_code", "").asString();
   envelope["ticket"] =

@@ -104,6 +104,13 @@ std::string Canonical(const std::string& action, const Json::Value& value) {
   std::string result = "teleop-enrollment-v1\n" + action;
   for (const auto* field : {"request_id", "public_key", "name", "serial",
                             "platform", "device_code", "ticket"}) {
+    // v1 retains three empty lines for retired metadata. Only these fields
+    // may be absent; existing clients' populated fields remain signed.
+    if ((std::string(field) == "name" || std::string(field) == "serial" ||
+         std::string(field) == "platform") && !value.isMember(field)) {
+      result += '\n';
+      continue;
+    }
     if (!value[field].isString())
       throw std::runtime_error("invalid enrollment field");
     const auto text = value[field].asString();

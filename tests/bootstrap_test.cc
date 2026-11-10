@@ -107,9 +107,6 @@ struct Fixture {
     chmod(directory.c_str(), 0700);
     config["gateway_url"] = "http://127.0.0.1:9999";
     config["console_url"] = "http://localhost:9998";
-    config["name"] = "Vehicle";
-    config["serial"] = "serial";
-    config["platform"] = "apollo";
     config["state_directory"] = directory;
     config["device_template"] = directory + "/template.json";
     config["device_config"] = directory + "/device.json";
@@ -148,14 +145,19 @@ struct Fixture {
                       : request.url.find("/complete") != std::string::npos
                           ? "complete"
                           : "create";
-        Require(value.size() == 10, "envelope not flat/exact");
+        unsigned legacy_fields = 0;
+        for (const auto* field : {"name", "serial", "platform"}) {
+          if (value.isMember(field)) {
+            Require(std::string(action) == "create" &&
+                        State().isMember(field) && value[field] == State()[field],
+                    "metadata not bound to a legacy create retry");
+            ++legacy_fields;
+          }
+        }
+        Require(value.size() == 7 + legacy_fields, "envelope not flat/exact");
         Require(nonces.insert(value["nonce"].asString()).second,
                 "nonce reused");
         Require(value["timestamp"].asInt64() == now, "wrong timestamp");
-        if (std::string(action) != "create")
-          Require(value["name"] == "" && value["serial"] == "" &&
-                      value["platform"] == "",
-                  "poll metadata not empty");
         auto key = e::DecodeBase64URL(value["public_key"].asString(), 32);
         auto signature = e::DecodeBase64URL(value["signature"].asString(), 64);
         EVP_PKEY* public_key = EVP_PKEY_new_raw_public_key(
@@ -231,6 +233,60 @@ void SignatureVector() {
               "rTJ5bkSBg-8-eRgBg",
           "enrollment signature vector mismatch");
   Reject([&] { e::DecodeBase64URL(e::PublicKey(seed) + "=", 32); });
+  for (const auto* field : {"name", "serial", "platform"})
+    envelope.removeMember(field);
+  Require(e::Canonical("create", envelope) ==
+              "teleop-enrollment-v1\ncreate\n123e4567-e89b-42d3-a456-426614174000\n"
+              "11qYAYKxCrfVS_7TyWQHOg7hcvPapiMlrwIaaPcHURo\n\n\n\n\n\n"
+              "1700000000\n123e4567-e89b-42d3-a456-426614174001",
+          "metadata-free v1 canonical mismatch");
+  auto signed_request = e::Sign("create", envelope, seed);
+  for (const auto* field : {"name", "serial", "platform"}) {
+    Require(!signed_request.isMember(field), "signing restored retired metadata");
+    auto invalid = envelope;
+    invalid[field] = Json::nullValue;
+    Reject([&] { e::Canonical("create", invalid); });
+  }
+  envelope.removeMember("public_key");
+  Reject([&] { e::Canonical("create", envelope); });
+}
+
+void MetadataFreeConfigurationAndLegacyRetry() {
+  Fixture f;
+  // Existing files are accepted, but their obsolete fields cannot become a
+  // new vehicle identity or new enrollment metadata.
+  f.config["name"] = "Old display name";
+  f.config["serial"] = "Old serial";
+  f.config["platform"] = "Old platform";
+  f.server = [](const e::Request&) -> e::Response { throw e::TransportError(); };
+  {
+    e::Bootstrap b(f.config, f.Hooks(), f.storage);
+    f.Tick(b);
+  }
+  auto state = f.State();
+  for (const auto* field : {"name", "serial", "platform"}) {
+    Require(!state.isMember(field), "new enrollment persisted obsolete metadata");
+    state[field] = f.config[field];
+    f.config.removeMember(field);
+  }
+  // Model a create response lost before upgrading the SDK. The saved request
+  // must be replayed unchanged even though bootstrap.json has no metadata.
+  f.storage.Write(f.directory + "/enrollment.json", state);
+  f.server = [](const e::Request&) { return e::Response{201, JSON(Enrollment("pending"))}; };
+  {
+    e::Bootstrap b(f.config, f.Hooks(), f.storage);
+    f.Tick(b);
+    auto retry = vehicle_edge::ParseHTTPJSON(f.requests.back().body);
+    Require(retry["request_id"] == state["request_id"] &&
+                retry["public_key"] == state["public_key"],
+            "legacy retry changed the request or key");
+    for (const auto* field : {"name", "serial", "platform"})
+      Require(retry[field] == state[field], "legacy retry changed signed metadata");
+    f.Tick(b);
+    auto poll = vehicle_edge::ParseHTTPJSON(f.requests.back().body);
+    for (const auto* field : {"name", "serial", "platform"})
+      Require(!poll.isMember(field), "poll sent retired metadata");
+  }
 }
 
 void RestartAndNetwork() {
@@ -739,6 +795,7 @@ int main() {
   try {
     SuiteDirectory suite;
     SignatureVector();
+    MetadataFreeConfigurationAndLegacyRetry();
     RestartAndNetwork();
     ExpiryDenialAndThrottle();
     AuthenticationClassification();
