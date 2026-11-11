@@ -21,7 +21,6 @@ cc_library(
     includes = ["include"],
     linkopts = ["-pthread"],
     target_compatible_with = [
-        "@platforms//cpu:x86_64",
         "@platforms//os:linux",
     ],
     deps = [
@@ -36,7 +35,6 @@ cc_binary(
     name = "vehicle_media_worker",
     srcs = ["media_worker.cc"],
     target_compatible_with = [
-        "@platforms//cpu:x86_64",
         "@platforms//os:linux",
     ],
     deps = [
@@ -52,4 +50,3 @@ filegroup(
         "@livekit_sdk//:runtime_libs",
     ],
 )
-
