@@ -225,7 +225,7 @@ public:
     }
     struct stat info {};
     if (fchmod(fd, 0600) != 0 || fstat(fd, &info) != 0 ||
-        !S_ISREG(info.st_mode) || info.st_uid != 0 ||
+        !S_ISREG(info.st_mode) || info.st_uid != geteuid() ||
         (info.st_mode & 0777) != 0600) {
       close(fd);
       unlink(path_.c_str());
@@ -335,11 +335,6 @@ void SuccessAndCompatibility() {
 }
 
 void ProtectedPathProducesSingleConfigurationStage() {
-  if (geteuid() != 0) {
-    std::cout << "SKIP protected config path regression: test requires root "
-                 "to create the required root-owned mode-0600 file\n";
-    return;
-  }
   LocalHTTPServer server(SuccessfulResponses());
   ProtectedConfigFile config_file(ConfigJSON(server.URL()));
   const auto report =
@@ -537,9 +532,9 @@ void InvalidRequestIDIsDiscarded() {
 class UserConfigFile {
 public:
   explicit UserConfigFile(const std::string &contents) {
-    path_ =
-        "/tmp/vehicle_local_debug_" + std::to_string(getpid()) + ".json";
-    unlink(path_.c_str());
+    static unsigned sequence = 0;
+    path_ = ".vehicle_local_debug_" + std::to_string(getpid()) + "_" +
+            std::to_string(++sequence) + ".json";
     const int fd =
         open(path_.c_str(), O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0600);
     if (fd < 0)
@@ -608,15 +603,10 @@ void LocalSimDebugAuthAndProtectedFile() {
           "local_sim_debug accepted non-loopback gateway_url");
 
   if (geteuid() != 0) {
-    UserConfigFile non_root_prod(ConfigJSON("https://gateway.example.com"));
-    bool rejected_non_root = false;
-    try {
-      (void)vehicle_edge::LoadAuthConfig(non_root_prod.path());
-    } catch (const std::runtime_error &) {
-      rejected_non_root = true;
-    }
-    Require(rejected_non_root,
-            "required auth_mode accepted non-root config file");
+    UserConfigFile non_root_prod(ConfigJSON("http://127.0.0.1:9999"));
+    Require(vehicle_edge::LoadAuthConfig(non_root_prod.path()).vehicle_id ==
+                "car-a",
+            "required auth_mode rejected protected current-user-owned config");
   }
 }
 

@@ -15,6 +15,7 @@
 #pragma once
 
 #include <chrono>
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <stdexcept>
@@ -44,7 +45,8 @@ class AuthClientError : public std::runtime_error {
 // Thread-safe single-flight OAuth 2.0 client_credentials token cache.
 class SharedTokenProvider {
  public:
-  explicit SharedTokenProvider(AuthConfig config);
+  explicit SharedTokenProvider(AuthConfig config,
+                               std::function<AuthConfig()> reload = {});
 
   std::string GetToken();
   void InvalidateToken(const std::string &token);
@@ -52,8 +54,10 @@ class SharedTokenProvider {
 
  private:
   void AcquireLocked();
+  bool ReloadCredentialsLocked();
 
   AuthConfig config_;
+  std::function<AuthConfig()> reload_;
   std::mutex mutex_;
   HTTPClient http_;
   std::string token_;

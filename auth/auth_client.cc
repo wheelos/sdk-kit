@@ -16,6 +16,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <json/json.h>
 #include <stdexcept>
 #include <utility>
 
@@ -38,8 +39,9 @@ void ValidateAPIPath(const std::string &path) {
 
 }  // namespace
 
-SharedTokenProvider::SharedTokenProvider(AuthConfig config)
-    : config_(std::move(config)) {}
+SharedTokenProvider::SharedTokenProvider(AuthConfig config,
+                                         std::function<AuthConfig()> reload)
+    : config_(std::move(config)), reload_(std::move(reload)) {}
 
 std::string SharedTokenProvider::GetToken() {
   std::lock_guard<std::mutex> lock(mutex_);
@@ -71,46 +73,92 @@ void SharedTokenProvider::InvalidateToken(const std::string &token) {
 }
 
 void SharedTokenProvider::AcquireLocked() {
-  const auto started = std::chrono::steady_clock::now();
-  HTTPResponse response{};
+  for (int attempt = 0; attempt < 2; ++attempt) {
+    const auto started = std::chrono::steady_clock::now();
+    HTTPResponse response{};
+    try {
+      response =
+          http_.Post(config_.token_url, "application/x-www-form-urlencoded",
+                     "grant_type=client_credentials&client_id=" +
+                         http_.Escape(config_.client_id) +
+                         "&client_secret=" +
+                         http_.Escape(config_.client_secret) +
+                         "&scope=teleop%3Avehicle",
+                     "", config_.allow_insecure_localhost);
+    } catch (...) {
+      throw AuthClientError("oauth_transport_error",
+                            "OAuth token request failed at the transport");
+    }
+    if (response.status != 200) {
+      bool invalid_client = false;
+      if (response.status == 400 || response.status == 401) {
+        try {
+          invalid_client =
+              ParseHTTPJSON(response.body)["error"] == "invalid_client";
+        } catch (const std::exception &) {
+        }
+      }
+      if (invalid_client && attempt == 0 && ReloadCredentialsLocked())
+        continue;
+      throw AuthClientError(
+          invalid_client ? "oauth_invalid_client" : "oauth_http_error",
+          invalid_client ? "OAuth rejected the configured client credentials"
+                         : "OAuth token endpoint rejected the request",
+          response.status);
+    }
+    Json::Value value;
+    try {
+      value = ParseHTTPJSON(response.body);
+    } catch (const std::exception &) {
+      throw AuthClientError("oauth_response_invalid",
+                            "OAuth token response was not valid JSON");
+    }
+    if (!value["access_token"].isString() ||
+        !ValidBearerToken(value["access_token"].asString()) ||
+        !value["expires_in"].isNumeric()) {
+      throw AuthClientError("oauth_response_invalid",
+                            "OAuth token response was incomplete or invalid");
+    }
+    const auto seconds = value["expires_in"].asDouble();
+    if (!std::isfinite(seconds) || seconds < 5 || seconds > 86400) {
+      throw AuthClientError("oauth_expiry_invalid",
+                            "OAuth expiry was outside the supported range");
+    }
+    token_ = value["access_token"].asString();
+    expires_at_ = started + std::chrono::milliseconds(
+                                static_cast<std::int64_t>(seconds * 800));
+    return;
+  }
+}
+
+bool SharedTokenProvider::ReloadCredentialsLocked() {
+  if (!reload_ && config_.credentials_file.empty())
+    return false;
+  AuthConfig updated;
   try {
-    response =
-        http_.Post(config_.token_url, "application/x-www-form-urlencoded",
-                   "grant_type=client_credentials&client_id=" +
-                       http_.Escape(config_.client_id) +
-                       "&client_secret=" + http_.Escape(config_.client_secret) +
-                       "&scope=teleop%3Avehicle",
-                   "", config_.allow_insecure_localhost);
-  } catch (...) {
-    throw AuthClientError("oauth_transport_error",
-                          "OAuth token request failed at the transport");
+    updated = reload_ ? reload_() : LoadAuthConfig(config_.credentials_file);
+  } catch (const std::exception &) {
+    throw AuthClientError("credentials_reload_failed",
+                          "protected credentials could not be reloaded");
   }
-  if (response.status != 200) {
-    throw AuthClientError("oauth_http_error",
-                          "OAuth token endpoint rejected the request",
-                          response.status);
+  if (updated.auth_mode != config_.auth_mode ||
+      updated.vehicle_id != config_.vehicle_id ||
+      updated.gateway_url != config_.gateway_url ||
+      updated.token_url != config_.token_url ||
+      updated.issuer != config_.issuer ||
+      updated.client_id != config_.client_id ||
+      updated.allow_insecure_localhost != config_.allow_insecure_localhost ||
+      updated.client_secret.empty()) {
+    throw AuthClientError(
+        "credentials_identity_changed",
+        "credential reload attempted to change device or endpoint identity");
   }
-  Json::Value value;
-  try {
-    value = ParseHTTPJSON(response.body);
-  } catch (...) {
-    throw AuthClientError("oauth_response_invalid",
-                          "OAuth token response was not valid JSON");
-  }
-  if (!value["access_token"].isString() ||
-      !ValidBearerToken(value["access_token"].asString()) ||
-      !value["expires_in"].isNumeric()) {
-    throw AuthClientError("oauth_response_invalid",
-                          "OAuth token response was incomplete or invalid");
-  }
-  const auto seconds = value["expires_in"].asDouble();
-  if (!std::isfinite(seconds) || seconds < 5 || seconds > 86400) {
-    throw AuthClientError("oauth_expiry_invalid",
-                          "OAuth expiry was outside the supported range");
-  }
-  token_ = value["access_token"].asString();
-  expires_at_ = started + std::chrono::milliseconds(
-                              static_cast<std::int64_t>(seconds * 800));
+  if (updated.client_secret == config_.client_secret)
+    return false;
+  config_.client_secret = std::move(updated.client_secret);
+  token_.clear();
+  expires_at_ = {};
+  return true;
 }
 
 AuthenticatedClient::AuthenticatedClient(

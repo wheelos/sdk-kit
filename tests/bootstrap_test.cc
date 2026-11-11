@@ -17,6 +17,8 @@
 #include <arpa/inet.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
+#include <sys/timex.h>
+#include <sys/wait.h>
 #include <unistd.h>
 
 #include <filesystem>
@@ -28,6 +30,7 @@
 #include <vector>
 
 #include <openssl/evp.h>
+#include <openssl/sha.h>
 
 #include "vehicle_edge/http_client.h"
 
@@ -73,6 +76,7 @@ Json::Value Enrollment(const std::string& status) {
   value["status"] = status;
   value["device_code"] = kCode;
   value["user_code"] = "ABCD-1234";
+  value["console_url"] = "http://localhost:9998";
   value["interval"] = 5;
   value["expires_in"] = 600;
   value["expires_at"] = "2030-01-01T00:00:00Z";
@@ -102,20 +106,16 @@ struct Fixture {
   std::set<std::string> nonces;
   std::vector<std::string> notices;
   std::function<e::Response(const e::Request&)> server;
+  std::string clock_error;
+  e::Response version_response{200, "{\"status\":\"ok\",\"protocol_version\":\"1\",\"enrollment_protocol\":\"teleop-enrollment-v1\"}"};
   Fixture() {
     std::filesystem::create_directory(directory);
     chmod(directory.c_str(), 0700);
     config["gateway_url"] = "http://127.0.0.1:9999";
-    config["console_url"] = "http://localhost:9998";
     config["state_directory"] = directory;
-    config["device_template"] = directory + "/template.json";
     config["device_config"] = directory + "/device.json";
+    config["credentials_config"] = directory + "/credentials.json";
     config["allow_insecure_localhost"] = true;
-    Json::Value base(Json::objectValue);
-    base["control_mode"] = "cyber";
-    base["node_name"] = "vehicle_telemetry";
-    base["map_id"] = "template-map";
-    storage.Write(directory + "/template.json", base);
     server = [](const e::Request&) {
       return e::Response{200, JSON(Enrollment("pending"))};
     };
@@ -124,6 +124,7 @@ struct Fixture {
   e::Hooks Hooks() {
     e::Hooks hooks;
     hooks.now = [this] { return now; };
+    hooks.clock_readiness = [this] { return clock_error; };
     hooks.notice = [this](const std::string& value) {
       Require(value.find(kCode) == std::string::npos &&
                   value.find(kTicket) == std::string::npos &&
@@ -132,6 +133,8 @@ struct Fixture {
       notices.push_back(value);
     };
     hooks.request = [this](const e::Request& request) {
+      if (request.url.find("/api/v1/version") != std::string::npos)
+        return version_response;
       Require(request.url.find(kCode) == std::string::npos &&
                   request.url.find(kTicket) == std::string::npos &&
                   request.url.find("protected-secret") == std::string::npos,
@@ -145,16 +148,10 @@ struct Fixture {
                       : request.url.find("/complete") != std::string::npos
                           ? "complete"
                           : "create";
-        unsigned legacy_fields = 0;
         for (const auto* field : {"name", "serial", "platform"}) {
-          if (value.isMember(field)) {
-            Require(std::string(action) == "create" &&
-                        State().isMember(field) && value[field] == State()[field],
-                    "metadata not bound to a legacy create retry");
-            ++legacy_fields;
-          }
+          Require(!value.isMember(field), "request contains retired metadata");
         }
-        Require(value.size() == 7 + legacy_fields, "envelope not flat/exact");
+        Require(value.size() == 7, "envelope not flat/exact");
         Require(nonces.insert(value["nonce"].asString()).second,
                 "nonce reused");
         Require(value["timestamp"].asInt64() == now, "wrong timestamp");
@@ -190,13 +187,17 @@ struct Fixture {
     return result;
   }
   Json::Value State() { return storage.Read(directory + "/enrollment.json"); }
+  std::string CredentialReference() const {
+    return std::filesystem::absolute(directory + "/credentials.json").string();
+  }
   void Existing() {
-    auto device = Credentials();
-    device.removeMember("issuer");
+    auto credentials = e::MergeCredentials(Json::Value(), Credentials(), true);
+    storage.Write(directory + "/credentials.json", credentials);
+    Json::Value device(Json::objectValue);
+    device["credentials_file"] = CredentialReference();
     device["control_mode"] = "cyber";
     device["map_id"] = "do-not-overwrite";
     device["media_enabled"] = false;
-    device["allow_insecure_localhost"] = true;
     storage.Write(directory + "/device.json", device);
   }
 };
@@ -251,13 +252,15 @@ void SignatureVector() {
   Reject([&] { e::Canonical("create", envelope); });
 }
 
-void MetadataFreeConfigurationAndLegacyRetry() {
+void MetadataFreeConfiguration() {
   Fixture f;
-  // Existing files are accepted, but their obsolete fields cannot become a
-  // new vehicle identity or new enrollment metadata.
-  f.config["name"] = "Old display name";
-  f.config["serial"] = "Old serial";
-  f.config["platform"] = "Old platform";
+  for (const auto* field :
+       {"name", "serial", "platform", "console_url", "device_template",
+        "allow_legacy_complete_404", "gateway_urll"}) {
+    f.config[field] = "retired-or-unknown";
+    Reject([&] { e::Bootstrap b(f.config, f.Hooks(), f.storage); });
+    f.config.removeMember(field);
+  }
   f.server = [](const e::Request&) -> e::Response { throw e::TransportError(); };
   {
     e::Bootstrap b(f.config, f.Hooks(), f.storage);
@@ -266,27 +269,10 @@ void MetadataFreeConfigurationAndLegacyRetry() {
   auto state = f.State();
   for (const auto* field : {"name", "serial", "platform"}) {
     Require(!state.isMember(field), "new enrollment persisted obsolete metadata");
-    state[field] = f.config[field];
-    f.config.removeMember(field);
+    state[field] = std::string("Old ") + field;
   }
-  // Model a create response lost before upgrading the SDK. The saved request
-  // must be replayed unchanged even though bootstrap.json has no metadata.
   f.storage.Write(f.directory + "/enrollment.json", state);
-  f.server = [](const e::Request&) { return e::Response{201, JSON(Enrollment("pending"))}; };
-  {
-    e::Bootstrap b(f.config, f.Hooks(), f.storage);
-    f.Tick(b);
-    auto retry = vehicle_edge::ParseHTTPJSON(f.requests.back().body);
-    Require(retry["request_id"] == state["request_id"] &&
-                retry["public_key"] == state["public_key"],
-            "legacy retry changed the request or key");
-    for (const auto* field : {"name", "serial", "platform"})
-      Require(retry[field] == state[field], "legacy retry changed signed metadata");
-    f.Tick(b);
-    auto poll = vehicle_edge::ParseHTTPJSON(f.requests.back().body);
-    for (const auto* field : {"name", "serial", "platform"})
-      Require(!poll.isMember(field), "poll sent retired metadata");
-  }
+  Reject([&] { e::Bootstrap b(f.config, f.Hooks(), f.storage); });
 }
 
 void RestartAndNetwork() {
@@ -341,6 +327,36 @@ void RestartAndNetwork() {
     Require(f.notices.back().find(kCode) == std::string::npos &&
                 f.notices.back().find("ABCD-1234") != std::string::npos,
             "notice leaked device code or omitted user code");
+    const auto raw = e::DecodeBase64URL(public_key, 32);
+    unsigned char digest[SHA256_DIGEST_LENGTH];
+    SHA256(reinterpret_cast<const unsigned char*>(raw.data()), raw.size(),
+           digest);
+    const char* hex = "0123456789abcdef";
+    std::string fingerprint = "SHA256:";
+    for (const auto byte : digest) {
+      fingerprint += hex[byte >> 4];
+      fingerprint += hex[byte & 15];
+    }
+    Require(f.notices.back().find(fingerprint) != std::string::npos,
+            "notice omitted the server-compatible public-key fingerprint");
+  }
+  {
+    e::Bootstrap b(f.config, f.Hooks(), f.storage);
+    Require(f.notices.back().find("Device fingerprint: ") !=
+                    std::string::npos &&
+                f.notices.back().find("(SHA256:") != std::string::npos,
+            "resumed enrollment omitted grouped + full fingerprint");
+  }
+  {
+    Fixture unsynced;
+    unsynced.now = 946684800;
+    e::Bootstrap b(unsynced.config, unsynced.Hooks(), unsynced.storage);
+    const auto blocked = b.Step();
+    Require(blocked.status == e::Status::Blocked &&
+                blocked.stage == "clock_check" &&
+                blocked.error_code == "CLOCK_NOT_SYNCHRONIZED" &&
+                unsynced.requests.empty(),
+            "unsynchronized system clock was not blocked before networking");
   }
 }
 
@@ -379,6 +395,44 @@ void ExpiryDenialAndThrottle() {
   Require(
       restart.Step().status == e::Status::Denied && f.requests.size() == count,
       "denial refreshed on restart");
+}
+
+void ClockAndVersionGates() {
+  Require(vehicle_edge::ClockDisciplineError(TIME_OK, 0, 1000000).empty() &&
+              !vehicle_edge::ClockDisciplineError(TIME_OK, STA_UNSYNC, 0).empty() &&
+              !vehicle_edge::ClockDisciplineError(TIME_ERROR, 0, 0).empty() &&
+              !vehicle_edge::ClockDisciplineError(TIME_OK, 0, 1000001).empty() &&
+              !vehicle_edge::ClockDisciplineError(-1, 0, 0).empty(),
+          "kernel clock readiness accepted unsynchronized/uncertain time");
+  for (const auto& error : {
+           "clock not synchronized: host kernel reports unsynchronized time",
+           "clock uncertainty exceeds 1 second: wait for host convergence",
+           "clock readiness unavailable: kernel query denied"}) {
+    Fixture f;
+    f.clock_error = error;
+    e::Bootstrap b(f.config, f.Hooks(), f.storage);
+    const auto result = b.Step();
+    Require(result.status == e::Status::Blocked &&
+                result.stage == "clock_check" && f.requests.empty(),
+            "plausible epoch bypassed time readiness evidence");
+  }
+  for (const auto& response : {
+           e::Response{404, ""},
+           e::Response{200, "invalid-json"},
+           e::Response{200, "{\"status\":\"ok\",\"protocol_version\":\"2\",\"enrollment_protocol\":\"teleop-enrollment-v1\"}"},
+           e::Response{200, "{\"status\":\"ok\",\"protocol_version\":\"1\",\"enrollment_protocol\":\"other\"}"}}) {
+    Fixture f;
+    f.Existing();
+    const auto original = f.storage.Read(f.directory + "/credentials.json");
+    f.version_response = response;
+    e::Bootstrap b(f.config, f.Hooks(), f.storage);
+    const auto result = b.Step();
+    Require(result.status == e::Status::Blocked &&
+                result.error_code == "GATEWAY_PROTOCOL_INCOMPATIBLE" &&
+                result.stage == "version_check" && f.requests.empty() &&
+                original == f.storage.Read(f.directory + "/credentials.json"),
+            "incompatible Gateway reached OAuth or changed active credentials");
+  }
 }
 
 void AuthenticationClassification() {
@@ -481,9 +535,10 @@ void InstallLostResponsesAndRecovery() {
       return {204, ""};
     Require(request.url.find("/installation-complete") != std::string::npos,
             "unexpected installation endpoint");
-    Require(f.storage.Read(f.directory + "/device.json")["client_secret"] ==
-                "protected-secret",
-            "ack occurred before durable credential write");
+    Require(
+        f.storage.Read(f.directory + "/credentials.json")["client_secret"] ==
+            "protected-secret",
+        "ack occurred before durable credential write");
     if (lose_ack) {
       lose_ack = false;
       throw e::TransportError();
@@ -510,21 +565,52 @@ void InstallLostResponsesAndRecovery() {
                 lost["ticket"] == retry["ticket"] &&
                 lost["nonce"] != retry["nonce"],
             "lost redeem response rotated credential");
-    auto device = f.storage.Read(f.directory + "/device.json");
-    Require(device["control_mode"] == "disabled",
-            "new install enabled control");
+    Require(f.storage.Read(f.directory + "/credentials.json", true).isNull() &&
+                f.storage.Read(f.directory + "/device.json", true).isNull() &&
+                !std::filesystem::exists(f.directory +
+                                         "/credentials.json.pending"),
+            "unvalidated candidate credentials wrote active or extra file");
+    auto staged = f.State()["pending_credentials"];
+    Require(staged.isObject() && staged.size() == 7 &&
+                !staged.isMember("control_mode") && !staged.isMember("issuer"),
+            "candidate credentials contain runtime or response-only fields");
     Require(f.Tick(b).status == e::Status::Waiting,
             "lost ack reported success");
+    auto device = f.storage.Read(f.directory + "/device.json");
+    Require(device["control_mode"] == "disabled" &&
+                device["media_enabled"] == false &&
+                device["task_mode"] == "disabled" &&
+                device["credentials_file"] == f.CredentialReference() &&
+                device.size() == 4,
+            "validated install did not create separated safe defaults");
+    auto auth = f.storage.Read(f.directory + "/credentials.json");
+    Require(auth == staged && !f.State().isMember("pending_credentials"),
+            "validated credentials were not atomically promoted from staging");
+    (void)vehicle_edge::ResolveDeviceConfig(device, auth);
   }
   {
+    // Even if enrollment.json was left in awaiting_install while valid
+    // credentials are already on disk, Bootstrap verifies device-auth-check
+    // and completes installation-complete directly without re-redeeming.
+    auto stale_state = f.State();
+    stale_state["status"] = "awaiting_install";
+    stale_state["ticket"] = kTicket;
+    stale_state["ticket_expires_at"] = Json::Int64(f.now + 300);
+    f.storage.Write(f.directory + "/enrollment.json", stale_state);
     e::Bootstrap b(f.config, f.Hooks(), f.storage);
+    const auto before = f.requests.size();
     Require(f.Tick(b).status == e::Status::Ready,
             "restart failed to retry machine ack");
+    for (std::size_t i = before; i < f.requests.size(); ++i) {
+      Require(f.requests[i].url.find("/device-enrollments") ==
+                  std::string::npos,
+              "valid local credentials re-redeemed enrollment ticket");
+    }
     Require(!f.State().isMember("ticket") && !f.State().isMember("device_code"),
             "installed state retained enrollment secrets");
   }
   auto key = f.State()["public_key"];
-  std::filesystem::remove(f.directory + "/device.json");
+  std::filesystem::remove(f.directory + "/credentials.json");
   {
     e::Bootstrap b(f.config, f.Hooks(), f.storage);
     Require(f.Tick(b).status == e::Status::Waiting &&
@@ -539,6 +625,10 @@ void CrashBetweenIntentAndWrite() {
   f.server = [](const e::Request& request) -> e::Response {
     if (request.url.find("/complete") != std::string::npos)
       return {200, JSON(Credentials())};
+    if (request.url.find("/oauth") != std::string::npos)
+      return {200, "{\"access_token\":\"machine-token\",\"expires_in\":300}"};
+    if (request.url.find("/device-auth-check") != std::string::npos)
+      return {403, "{\"code\":\"VEHICLE_MAPPING_DENIED\"}"};
     return {200, JSON(Enrollment("awaiting_install"))};
   };
   {
@@ -547,30 +637,106 @@ void CrashBetweenIntentAndWrite() {
     f.Tick(b);
   }
   auto state = f.State();
-  Require(state["status"] == "installing", "installation intent not saved");
+  Require(state["status"] == "validating", "validation intent not saved");
   f.Existing();
-  auto old = f.storage.Read(f.directory + "/device.json");
+  auto old = f.storage.Read(f.directory + "/credentials.json");
   old["client_id"] = "old-client";
   old["client_secret"] = "old-secret";
-  f.storage.Write(f.directory + "/device.json", old);
+  f.storage.Write(f.directory + "/credentials.json", old);
+  {
+    e::Bootstrap b(f.config, f.Hooks(), f.storage);
+    auto blocked = f.Tick(b);
+    Require(blocked.status == e::Status::Blocked &&
+                f.storage.Read(f.directory + "/credentials.json") == old,
+            "failed candidate validation overwrote active credentials");
+  }
+  f.now += 5;
+  auto interrupted = f.State();
+  interrupted.removeMember("pending_credentials");
+  f.storage.Write(f.directory + "/enrollment.json", interrupted);
+  f.server = [](const e::Request& request) -> e::Response {
+    if (request.url.find("/complete") != std::string::npos)
+      return {200, JSON(Credentials())};
+    if (request.url.find("/oauth") != std::string::npos)
+      return {200, "{\"access_token\":\"machine-token\",\"expires_in\":300}"};
+    return {204, ""};
+  };
   {
     e::Bootstrap b(f.config, f.Hooks(), f.storage);
     f.Tick(b);
-    Require(f.requests.back().url.find("/complete") != std::string::npos,
-            "crash before credential write authenticated rejected old secret");
+    Require(f.requests.back().url.find("/complete") != std::string::npos &&
+                f.storage.Read(f.directory + "/credentials.json") == old,
+            "crash before staging authenticated old secret or wrote early");
+    Require(f.Tick(b).status == e::Status::Ready,
+            "re-staged candidate did not validate and commit");
     auto merged = f.storage.Read(f.directory + "/device.json");
     Require(merged["map_id"] == "do-not-overwrite" &&
                 merged["media_enabled"] == false &&
                 merged["control_mode"] == "cyber",
             "recovery overwrote runtime configuration");
+    Require(!merged.isMember("client_secret") &&
+                merged["credentials_file"] == f.CredentialReference(),
+            "recovery mixed configuration responsibilities");
   }
 }
 
-void LegacyAckAndActiveWithoutSecret() {
-  for (bool allow : {false, true}) {
+void CredentialUpdateNoticeSurvivesRestart() {
+  Fixture f;
+  bool lose_ack = true;
+  f.server = [&](const e::Request& request) -> e::Response {
+    if (request.url.find("/complete") != std::string::npos)
+      return {200, JSON(Credentials())};
+    if (request.url.find("/oauth") != std::string::npos)
+      return {200, "{\"access_token\":\"machine-token\",\"expires_in\":300}"};
+    if (request.url.find("/device-auth-check") != std::string::npos)
+      return {204, ""};
+    if (request.url.find("/installation-complete") != std::string::npos) {
+      if (lose_ack) {
+        lose_ack = false;
+        throw e::TransportError();
+      }
+      return {204, ""};
+    }
+    return {200, JSON(Enrollment("awaiting_install"))};
+  };
+  {
+    e::Bootstrap b(f.config, f.Hooks(), f.storage);
+    f.Tick(b);
+  }
+  f.Existing();
+  auto old = f.storage.Read(f.directory + "/credentials.json");
+  old["client_secret"] = "previous-secret";
+  f.storage.Write(f.directory + "/credentials.json", old);
+  {
+    e::Bootstrap b(f.config, f.Hooks(), f.storage);
+    f.Tick(b);
+    Require(f.storage.Read(f.directory + "/credentials.json") == old,
+            "staging replaced active credentials before validation");
+    Require(f.Tick(b).status == e::Status::Waiting &&
+                f.State()["credentials_updated"].asBool(),
+            "credential-change notice not persisted before acknowledgment");
+  }
+  {
+    e::Bootstrap b(f.config, f.Hooks(), f.storage);
+    Require(f.Tick(b).status == e::Status::Ready &&
+                f.notices.back().find("safe maintenance stop") !=
+                    std::string::npos &&
+                !f.State().isMember("credentials_updated"),
+            "acknowledgment omitted or retained credential-change notice");
+  }
+  const auto notices = f.notices.size();
+  {
+    e::Bootstrap b(f.config, f.Hooks(), f.storage);
+    Require(f.Tick(b).status == e::Status::Ready &&
+                f.notices.size() == notices,
+            "unchanged credentials repeated restart notice");
+  }
+}
+
+void RequiredAckAndActiveWithoutSecret() {
+  {
     Fixture f;
     f.Existing();
-    f.config["allow_legacy_complete_404"] = allow;
     f.server = [](const e::Request& request) -> e::Response {
       if (request.url.find("/oauth") != std::string::npos)
         return {200, "{\"access_token\":\"machine-token\",\"expires_in\":300}"};
@@ -579,11 +745,10 @@ void LegacyAckAndActiveWithoutSecret() {
               ""};
     };
     e::Bootstrap b(f.config, f.Hooks(), f.storage);
-    Require(f.Tick(b).status == (allow ? e::Status::Ready : e::Status::Blocked),
-            "legacy ack opt-in not enforced");
+    Require(f.Tick(b).status == e::Status::Blocked,
+            "missing installation acknowledgment was accepted");
   }
   Fixture f;
-  f.config["allow_legacy_complete_404"] = true;
   f.server = [](const e::Request&) {
     auto active = Enrollment("active");
     active.removeMember("device_code");
@@ -653,7 +818,6 @@ void FailedRepairAndInvalidEnrollment() {
 
 void TicketExpiryAndNewAck() {
   Fixture f;
-  f.config["allow_legacy_complete_404"] = true;
   f.server = [](const e::Request&) {
     auto value = Enrollment("awaiting_install");
     value["ticket_expires_at"] = "2020-01-01T00:00:00Z";
@@ -688,7 +852,7 @@ void TicketExpiryAndNewAck() {
   };
   Require(f.Tick(b).status == e::Status::Blocked &&
               f.State()["status"] == "installing",
-          "new enrollment bypassed ack using legacy 404 option");
+          "new enrollment bypassed required acknowledgment");
 }
 
 void LocalHTTPTransport() {
@@ -757,7 +921,9 @@ void SafeStorageAndMerge() {
   value["secret"] = "replacement";
   f.storage.Write(path, value);
   Require(f.storage.Read(path) == value, "atomic replacement failed");
-  if (geteuid() != 0) Reject([&] { e::Storage().Read(path); });
+  Require(e::Storage().Read(path) == value,
+          "default storage did not use effective owner");
+  if (geteuid() != 0) Reject([&] { e::Storage(0).Read(path); });
   chmod(path.c_str(), 0644);
   Reject([&] { f.storage.Read(path); });
   Reject([&] { f.storage.Write(path, value); });
@@ -772,12 +938,50 @@ void SafeStorageAndMerge() {
   auto existing = credentials;
   existing.removeMember("issuer");
   existing["vehicle_id"] = "another-vehicle";
-  Reject([&] {
-    e::MergeDevice(Json::Value(Json::objectValue), existing, credentials, true);
-  });
-  Json::Value oversized(Json::objectValue);
-  oversized["software_version"] = std::string(17000, 'v');
-  Reject([&] { e::MergeDevice(oversized, Json::Value(), credentials, true); });
+  Reject([&] { e::MergeCredentials(existing, credentials, true); });
+  auto oversized = credentials;
+  oversized["client_secret"] = std::string(17000, 'v');
+  Reject([&] { e::MergeCredentials(Json::Value(), oversized, true); });
+  Json::Value prod_creds(Json::objectValue);
+  prod_creds["vehicle_id"] = "veh-001";
+  prod_creds["client_id"] = "client-prod";
+  prod_creds["client_secret"] = "prod-secret";
+  prod_creds["gateway_url"] = "https://gateway.example.com";
+  prod_creds["token_url"] =
+      "https://auth.example.com/api/login/oauth/access_token";
+  prod_creds["issuer"] = "https://auth.example.com";
+  const auto merged_prod =
+      e::MergeCredentials(Json::Value(), prod_creds, false);
+  Require(merged_prod.size() == 7 && merged_prod["issuer"] == prod_creds["issuer"] &&
+              !merged_prod.isMember("allow_insecure_localhost"),
+          "production credentials included allow_insecure_localhost");
+  Reject([&] { e::MergeCredentials(Json::Value(), prod_creds, true); });
+  auto untrusted_token = prod_creds;
+  untrusted_token["token_url"] = "https://evil.attacker.org/oauth/token";
+  Reject([&] { e::MergeCredentials(Json::Value(), untrusted_token, false); });
+  auto untrusted_issuer = prod_creds;
+  untrusted_issuer["issuer"] = "https://evil.attacker.org";
+  untrusted_issuer["token_url"] = "https://evil.attacker.org/oauth/token";
+  Require(e::MergeCredentials(Json::Value(), untrusted_issuer, false)["issuer"] ==
+              untrusted_issuer["issuer"],
+          "authenticated Gateway cannot delegate to an exact cross-domain issuer");
+  for (const auto& token : {"https://attacker.co.uk/oauth",
+                           "https://victim.github.io/oauth",
+                           "https://auth.example.com:8444/oauth"}) {
+    Require(!vehicle_edge::TrustedTokenEndpoint(token,
+                "https://gateway.co.uk", "https://auth.example.com", false),
+            "token escaped exact trusted issuer origin");
+  }
+  Require(!vehicle_edge::TrustedTokenEndpoint("https://attacker.co.uk/oauth",
+              "https://gateway.co.uk", "", false),
+          "shared public suffix trusted without explicit issuer");
+  Require(vehicle_edge::TrustedTokenEndpoint("https://AUTH.EXAMPLE.com:443/token",
+              "https://gateway.co.uk", "https://auth.example.com", false),
+          "equivalent HTTPS origin rejected");
+  Json::Value remote_local_flag(Json::objectValue);
+  remote_local_flag["gateway_url"] = "https://gateway.example.com";
+  remote_local_flag["allow_insecure_localhost"] = true;
+  Reject([&] { e::ParseBootstrapConfig(remote_local_flag); });
   Require(!vehicle_edge::AllowedURL("http://gateway.example.com", true),
           "local test enabled remote HTTP");
   Require(!vehicle_edge::AllowedURL("https://user:secret@example.com", false),
@@ -789,24 +993,309 @@ void SafeStorageAndMerge() {
   for (const auto& entry : std::filesystem::directory_iterator(f.directory))
     Require(entry.path().extension() != ".new", "atomic scratch file leaked");
 }
+
+void AutomaticDirectoriesAndSeparatedConfiguration() {
+  Fixture f;
+  const auto nested = f.directory + "/new/state";
+  f.storage.EnsureDirectory(nested);
+  f.storage.EnsureDirectory(nested);
+  struct stat info {};
+  Require(stat(nested.c_str(), &info) == 0 && (info.st_mode & 0777) == 0700 &&
+              info.st_uid == geteuid(),
+          "automatic protected directory creation failed");
+  std::filesystem::create_directory(f.directory + "/untrusted");
+  chmod((f.directory + "/untrusted").c_str(), 0777);
+  Reject([&] { f.storage.EnsureDirectory(f.directory + "/untrusted/state"); });
+  std::filesystem::create_directory_symlink("new", f.directory + "/linked");
+  Reject([&] { f.storage.EnsureDirectory(f.directory + "/linked/state"); });
+
+  f.Existing();
+  f.server = [](const e::Request& request) -> e::Response {
+    if (request.url.find("/oauth") != std::string::npos)
+      return {200, "{\"access_token\":\"machine-token\",\"expires_in\":300}"};
+    return {204, ""};
+  };
+  Json::Value runtime, credentials, key;
+  struct stat runtime_info {};
+  {
+    e::Bootstrap bootstrap(f.config, f.Hooks(), f.storage);
+    Require(f.Tick(bootstrap).status == e::Status::Ready,
+            "split installation authentication failed");
+    runtime = f.storage.Read(f.directory + "/device.json");
+    credentials = f.storage.Read(f.directory + "/credentials.json");
+    key = f.storage.Read(f.directory + "/key.json");
+    Require(runtime["map_id"] == "do-not-overwrite" &&
+                runtime["control_mode"] == "cyber" &&
+                !runtime.isMember("client_secret") &&
+                credentials["client_secret"] == "protected-secret",
+            "authentication lost runtime settings or mixed responsibilities");
+    Require(stat((f.directory + "/device.json").c_str(), &runtime_info) == 0,
+            "cannot inspect runtime");
+    {
+      const auto resolved =
+          vehicle_edge::LoadDeviceConfigJSON(f.directory + "/device.json");
+      Require(resolved["map_id"] == "do-not-overwrite" &&
+                  resolved["client_secret"] == "protected-secret" &&
+                  !resolved.isMember("credentials_file"),
+              "protected split config loading failed");
+      Require(vehicle_edge::LoadAuthConfig(f.directory + "/device.json")
+                      .vehicle_id == "veh-001",
+              "diagnostic authentication loader did not resolve credentials");
+    }
+  }
+  {
+    e::Bootstrap bootstrap(f.config, f.Hooks(), f.storage);
+    Require(
+        f.Tick(bootstrap).status == e::Status::Ready &&
+            f.storage.Read(f.directory + "/device.json") == runtime &&
+            f.storage.Read(f.directory + "/credentials.json") == credentials &&
+            f.storage.Read(f.directory + "/key.json") == key,
+        "repeated authentication overwrote runtime settings or key");
+    struct stat unchanged {};
+    Require(stat((f.directory + "/device.json").c_str(), &unchanged) == 0 &&
+                unchanged.st_ino == runtime_info.st_ino,
+            "authentication unnecessarily replaced runtime configuration");
+  }
+  runtime["client_secret"] = "must-not-be-inline";
+  Reject([&] { vehicle_edge::ResolveDeviceConfig(runtime, credentials); });
+  runtime.removeMember("client_secret");
+  credentials["media_enabled"] = true;
+  Reject([&] { vehicle_edge::ResolveDeviceConfig(runtime, credentials); });
+}
+
+void GroupReadableRotation() {
+  if (geteuid() != 0) return;
+  Fixture f;
+  f.Existing();
+  constexpr gid_t group = 1000;
+  const auto path = f.directory + "/credentials.json";
+  Require(chown(".", 0, group) == 0 && chmod(".", 0750) == 0 &&
+              chown(f.directory.c_str(), 0, group) == 0 &&
+              chmod(f.directory.c_str(), 0750) == 0 &&
+              chown(path.c_str(), 0, group) == 0 && chmod(path.c_str(), 0640) == 0,
+          "cannot provision isolated runtime group");
+  f.storage.EnsureDirectory(f.directory);
+  auto credentials = f.storage.Read(path);
+  credentials["client_secret"] = "rotated-protected-secret";
+  f.storage.Write(path, credentials);
+  struct stat file {}, directory {};
+  Require(stat(path.c_str(), &file) == 0 && file.st_uid == 0 &&
+              file.st_gid == group && (file.st_mode & 07777) == 0640 &&
+              stat(f.directory.c_str(), &directory) == 0 &&
+              (directory.st_mode & 07777) == 0750 &&
+              vehicle_edge::LoadAuthConfig(path).client_secret ==
+                  "rotated-protected-secret",
+          "root rotation dropped runtime group protection or root read access");
+  const auto child = fork();
+  Require(child >= 0, "cannot fork isolated runtime reader");
+  if (child == 0) {
+    if (setgid(group) || setuid(1000)) _exit(1);
+    try {
+      Require(vehicle_edge::LoadAuthConfig(path).client_secret ==
+                  "rotated-protected-secret",
+              "non-root could not read rotated credentials");
+      // Group readers cannot mutate the root-owned protected parent.
+      Require(access(f.directory.c_str(), W_OK) != 0,
+              "runtime group can write credential directory");
+      _exit(0);
+    } catch (...) { _exit(1); }
+  }
+  int status = 0;
+  Require(waitpid(child, &status, 0) == child && WIFEXITED(status) &&
+              WEXITSTATUS(status) == 0,
+          "dedicated non-root group could not read rotated credentials");
+  Require(chmod(path.c_str(), 0644) == 0, "cannot set unsafe fixture mode");
+  Reject([&] { vehicle_edge::LoadAuthConfig(path); });
+  Require(chmod(path.c_str(), 0640) == 0 &&
+              chmod(f.directory.c_str(), 0770) == 0,
+          "cannot set writable fixture parent");
+  Reject([&] { vehicle_edge::LoadAuthConfig(path); });
+  Require(chmod(f.directory.c_str(), 0750) == 0,
+          "cannot restore protected fixture parent");
+  Require(chmod(".", 0700) == 0, "cannot restore isolated test permissions");
+}
+
+void LegacyCrossOriginUpgrade() {
+  Fixture f;
+  f.config.removeMember("allow_insecure_localhost");
+  f.config["gateway_url"] = "https://gateway.example.com";
+  Json::Value old(Json::objectValue);
+  old["auth_mode"] = "required";
+  old["vehicle_id"] = "veh-001";
+  old["gateway_url"] = f.config["gateway_url"];
+  old["token_url"] = "https://login.example.com/token";
+  old["client_id"] = "client-new";
+  old["client_secret"] = "old-secret";
+  f.storage.Write(f.directory + "/credentials.json", old);
+  Reject([&] { vehicle_edge::LoadAuthConfig(f.directory + "/credentials.json"); });
+  f.server = [&](const e::Request& req) -> e::Response {
+    Require(req.url.find("login.example.com") == std::string::npos,
+            "legacy secret sent to untrusted token origin");
+    auto pending = Enrollment("pending");
+    pending["console_url"] = "https://console.example.com";
+    return {201, JSON(pending)};
+  };
+  {
+    e::Bootstrap b(f.config, f.Hooks(), f.storage);
+    Require(f.Tick(b).status == e::Status::Waiting &&
+                f.State()["status"] == "pending" &&
+                f.storage.Read(f.directory + "/credentials.json") == old,
+            "legacy upgrade did not preserve credentials and request approval");
+  }
+  const auto key = f.State()["public_key"];
+  const auto request = f.State()["request_id"];
+  f.server = [&](const e::Request& req) -> e::Response {
+    Require(req.url.find("login.example.com") == std::string::npos,
+            "active legacy enrollment sent an old secret to an untrusted issuer");
+    auto active = Enrollment("active");
+    active["console_url"] = "https://console.example.com";
+    return {200, JSON(active)};
+  };
+  {
+    e::Bootstrap b(f.config, f.Hooks(), f.storage);
+    Require(f.Tick(b).status == e::Status::Waiting &&
+                f.State()["status"] == "creating" &&
+                f.State()["request_id"] != request &&
+                f.State()["public_key"] == key &&
+                f.storage.Read(f.directory + "/credentials.json") == old,
+            "poll-active legacy credentials did not start signed same-key recovery");
+  }
+  f.server = [&](const e::Request&) -> e::Response {
+    auto pending = Enrollment("pending");
+    pending["console_url"] = "https://console.example.com";
+    return {201, JSON(pending)};
+  };
+  {
+    e::Bootstrap b(f.config, f.Hooks(), f.storage);
+    Require(f.Tick(b).status == e::Status::Waiting &&
+                f.State()["status"] == "pending" &&
+                f.State()["public_key"] == key,
+            "legacy recovery bypassed fresh administrator approval");
+  }
+}
+
+void BootstrapDefaultsAndCrashAfterCredentials() {
+  Json::Value addresses(Json::objectValue);
+  addresses["gateway_url"] = "https://gateway.example.com";
+  const auto config = e::ParseBootstrapConfig(addresses);
+  Require(config["state_directory"] == "/var/lib/teleop/bootstrap" &&
+              config["device_config"] == "/etc/teleop/device.json" &&
+              config["credentials_config"] == "/etc/teleop/credentials.json",
+          "address-only bootstrap requires operator-managed paths");
+  addresses["allow_insecure_localhost"] = "false";
+  Reject([&] { e::ParseBootstrapConfig(addresses); });
+  addresses.removeMember("allow_insecure_localhost");
+  addresses["device_config"] = "/etc/teleop/credentials.json";
+  Reject([&] { e::ParseBootstrapConfig(addresses); });
+
+  Fixture f;
+  bool lose_ack = true;
+  f.server = [&](const e::Request& request) -> e::Response {
+    if (request.url.find("/complete") != std::string::npos)
+      return {200, JSON(Credentials())};
+    if (request.url.find("/oauth") != std::string::npos)
+      return {200, "{\"access_token\":\"machine-token\",\"expires_in\":300}"};
+    if (request.url.find("/device-auth-check") != std::string::npos)
+      return {204, ""};
+    if (request.url.find("/installation-complete") != std::string::npos) {
+      if (lose_ack) {
+        lose_ack = false;
+        throw e::TransportError();
+      }
+      return {204, ""};
+    }
+    return {200, JSON(Enrollment("awaiting_install"))};
+  };
+  {
+    e::Bootstrap bootstrap(f.config, f.Hooks(), f.storage);
+    f.Tick(bootstrap);
+    f.Tick(bootstrap);
+    Require(f.Tick(bootstrap).status == e::Status::Waiting,
+            "first acknowledgment did not fail as modeled");
+  }
+  // Model credentials committed before first runtime creation.
+  std::filesystem::remove(f.directory + "/device.json");
+  f.server = [&](const e::Request& request) -> e::Response {
+    Require(request.url.find("device-enrollments") == std::string::npos,
+            "durable credentials were unnecessarily redeemed again");
+    if (request.url.find("/oauth") != std::string::npos) {
+      Require(request.body.find("protected-secret") != std::string::npos,
+              "restart did not authenticate durable credentials");
+      return {200, "{\"access_token\":\"machine-token\",\"expires_in\":300}"};
+    }
+    if (request.url.find("installation-complete") != std::string::npos)
+      Require(f.storage.Read(f.directory + "/device.json")["credentials_file"] ==
+                  f.CredentialReference(),
+              "ack preceded runtime creation");
+    return {204, ""};
+  };
+  e::Bootstrap bootstrap(f.config, f.Hooks(), f.storage);
+  Require(
+      f.Tick(bootstrap).status == e::Status::Ready &&
+          f.storage.Read(f.directory + "/device.json").size() == 4,
+      "crash after credentials was not repaired with safe defaults");
+}
+
+void RejectMixedAndFlatConfiguration() {
+  Fixture f;
+  f.server = [](const e::Request&) -> e::Response {
+    throw std::runtime_error("invalid configuration reached the network");
+  };
+  auto flat = e::MergeCredentials(Json::Value(), Credentials(), true);
+  flat["map_id"] = "obsolete-mixed-file";
+  f.storage.Write(f.directory + "/device.json", flat);
+  Reject([&] { e::Bootstrap bootstrap(f.config, f.Hooks(), f.storage); });
+  Require(!std::filesystem::exists(f.directory + "/credentials.json") &&
+              f.storage.Read(f.directory + "/device.json") == flat,
+          "flat configuration was migrated instead of rejected");
+  f.Existing();
+  auto runtime = f.storage.Read(f.directory + "/device.json");
+  runtime["client_secret"] = "must-not-be-inline";
+  f.storage.Write(f.directory + "/device.json", runtime);
+  Reject([&] { e::Bootstrap bootstrap(f.config, f.Hooks(), f.storage); });
+  runtime.removeMember("client_secret");
+  runtime["credentials_file"] = "/etc/teleop/unmanaged.json";
+  f.storage.Write(f.directory + "/device.json", runtime);
+  Reject([&] { e::Bootstrap bootstrap(f.config, f.Hooks(), f.storage); });
+  if (geteuid() == 0) {
+    f.storage.Write(f.directory + "/device.json", flat);
+    Reject([&] {
+      vehicle_edge::LoadDeviceConfigJSON(f.directory + "/device.json");
+    });
+    Reject([&] {
+      vehicle_edge::LoadAuthConfig(f.directory + "/device.json");
+    });
+    f.Existing();
+    Require(vehicle_edge::LoadAuthConfig(f.directory + "/credentials.json")
+                    .vehicle_id == "veh-001",
+            "standalone authentication credentials were rejected");
+  }
+}
 }  // namespace
 
 int main() {
   try {
     SuiteDirectory suite;
     SignatureVector();
-    MetadataFreeConfigurationAndLegacyRetry();
+    MetadataFreeConfiguration();
     RestartAndNetwork();
     ExpiryDenialAndThrottle();
+    ClockAndVersionGates();
     AuthenticationClassification();
     PendingCredentialRecoverySurvivesTimers();
     InstallLostResponsesAndRecovery();
     CrashBetweenIntentAndWrite();
-    LegacyAckAndActiveWithoutSecret();
+    CredentialUpdateNoticeSurvivesRestart();
+    RequiredAckAndActiveWithoutSecret();
     FailedRepairAndInvalidEnrollment();
     TicketExpiryAndNewAck();
     LocalHTTPTransport();
     SafeStorageAndMerge();
+    AutomaticDirectoriesAndSeparatedConfiguration();
+    GroupReadableRotation();
+    LegacyCrossOriginUpgrade();
+    BootstrapDefaultsAndCrashAfterCredentials();
+    RejectMixedAndFlatConfiguration();
     std::cout << "bootstrap tests passed\n";
     return 0;
   } catch (const std::exception& error) {

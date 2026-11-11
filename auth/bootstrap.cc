@@ -19,6 +19,7 @@
 #include <algorithm>
 #include <chrono>
 #include <ctime>
+#include <filesystem>
 #include <stdexcept>
 #include <utility>
 
@@ -73,6 +74,31 @@ std::string JSON(const Json::Value& value) {
   Json::StreamWriterBuilder writer;
   writer["indentation"] = "";
   return Json::writeString(writer, value);
+}
+std::string Fingerprint(const std::string& private_key) {
+  const auto raw = DecodeBase64URL(PublicKey(private_key), 32);
+  unsigned char digest[SHA256_DIGEST_LENGTH];
+  if (!SHA256(reinterpret_cast<const unsigned char*>(raw.data()), raw.size(),
+              digest))
+    throw std::runtime_error("cannot compute device fingerprint");
+  const char* hex = "0123456789abcdef";
+  std::string result = "SHA256:";
+  for (const auto byte : digest) {
+    result += hex[byte >> 4];
+    result += hex[byte & 15];
+  }
+  return result;
+}
+std::string FormattedFingerprint(const std::string& private_key) {
+  const auto full = Fingerprint(private_key);
+  const auto hex = full.substr(7);
+  std::string short_fp;
+  for (std::size_t i = 0; i < 16 && i < hex.size(); ++i) {
+    if (i > 0 && i % 4 == 0) short_fp += '-';
+    short_fp +=
+        static_cast<char>(std::toupper(static_cast<unsigned char>(hex[i])));
+  }
+  return short_fp + " (" + full + ")";
 }
 std::int64_t Expiry(const Json::Value& value, const char* field) {
   auto text = Text(value, field, 32);
@@ -140,7 +166,8 @@ std::string TransientHint(long status) {
 std::string CredentialDigest(const Json::Value& device) {
   Json::Value auth(Json::objectValue);
   for (const auto* field :
-       {"vehicle_id", "client_id", "client_secret", "token_url", "gateway_url"})
+       {"vehicle_id", "client_id", "client_secret", "token_url", "gateway_url",
+        "issuer"})
     auth[field] = device[field];
   const auto text = JSON(auth);
   std::string digest(SHA256_DIGEST_LENGTH, '\0');
@@ -161,38 +188,90 @@ bool InvalidCredentials(const Response& response) {
   }
 }
 
-Json::Value MergeDevice(const Json::Value& base, const Json::Value& existing,
-                        const Json::Value& credentials, bool local_test) {
-  if (!base.isObject() || (!existing.isNull() && !existing.isObject()))
-    throw std::runtime_error("invalid runtime template");
-  Json::Value merged = base;
+Json::Value MergeCredentials(const Json::Value& existing,
+                             const Json::Value& credentials, bool local_test) {
+  if (!existing.isNull() && !existing.isObject())
+    throw std::runtime_error("invalid existing credentials");
+  Json::Value merged(Json::objectValue);
   if (existing.isObject()) {
-    for (const auto& name : existing.getMemberNames())
-      merged[name] = existing[name];
     if (existing["vehicle_id"].isString() &&
         !existing["vehicle_id"].asString().empty() &&
         existing["vehicle_id"] != credentials["vehicle_id"])
       throw std::runtime_error("recovery must retain vehicle identity");
   }
-  // A new installation must never inherit a template's control enablement.
-  if (!existing.isMember("control_mode")) merged["control_mode"] = "disabled";
   merged["auth_mode"] = "required";
   for (const auto* field : {"vehicle_id", "client_id", "client_secret",
                             "token_url", "gateway_url"}) {
     merged[field] = Text(credentials, field,
                          field == std::string("client_secret") ? 4096 : 2048);
   }
-  merged["allow_insecure_localhost"] = local_test;
+  auto gateway_url = merged["gateway_url"].asString();
+  while (gateway_url.size() > 1 && gateway_url.back() == '/')
+    gateway_url.pop_back();
+  merged["gateway_url"] = gateway_url;
+  const std::string issuer =
+      credentials["issuer"].isString() ? Text(credentials, "issuer", 2048) : "";
+  if (!TrustedTokenEndpoint(merged["token_url"].asString(), gateway_url, issuer,
+                            local_test)) {
+    throw std::runtime_error(
+        "untrusted token_url or issuer domain in redeemed credentials");
+  }
+  if (!issuer.empty() && !local_test) merged["issuer"] = issuer;
+  if (local_test) {
+    merged["allow_insecure_localhost"] = true;
+  }
   (void)ParseAuthConfig(merged);
   Json::StreamWriterBuilder writer;
   writer["indentation"] = "  ";
   if (Json::writeString(writer, merged).size() + 1 > 16384)
-    throw std::runtime_error("runtime device configuration exceeds 16 KiB");
+    throw std::runtime_error("credentials exceed 16 KiB");
   return merged;
 }
 
+Json::Value ParseBootstrapConfig(Json::Value config) {
+  if (!config.isObject())
+    throw std::runtime_error("bootstrap config must be an object");
+  for (const auto& name : config.getMemberNames()) {
+    if (name != "gateway_url" && name != "state_directory" && name != "device_config" &&
+        name != "credentials_config" && name != "allow_insecure_localhost")
+      throw std::runtime_error("unsupported bootstrap field; remove " + name);
+  }
+  if (config.isMember("allow_insecure_localhost")) {
+#ifdef TELEOP_PRODUCTION_BUILD
+    throw std::runtime_error(
+        "allow_insecure_localhost is disabled in production builds");
+#endif
+    if (!config["allow_insecure_localhost"].isBool())
+      throw std::runtime_error("bootstrap flags must be boolean");
+  }
+  const bool local_test =
+      config.get("allow_insecure_localhost", false).asBool();
+  auto url = Text(config, "gateway_url", 2048);
+  if (local_test && !LoopbackURL(url))
+    throw std::runtime_error(
+        "allow_insecure_localhost requires a loopback gateway_url");
+  if (!AllowedURL(url, local_test))
+    throw std::runtime_error("HTTPS required");
+  while (url.back() == '/') url.pop_back();
+  config["gateway_url"] = url;
+  if (!config.isMember("state_directory"))
+    config["state_directory"] = "/var/lib/teleop/bootstrap";
+  if (!config.isMember("device_config"))
+    config["device_config"] = "/etc/teleop/device.json";
+  if (!config.isMember("credentials_config"))
+    config["credentials_config"] = "/etc/teleop/credentials.json";
+  for (const auto* field :
+       {"state_directory", "device_config", "credentials_config"})
+    Text(config, field, 4096);
+  if (config["device_config"] == config["credentials_config"])
+    throw std::runtime_error("runtime and credentials paths must differ");
+  return config;
+}
+
 Bootstrap::Bootstrap(Json::Value config, Hooks hooks, Storage storage)
-    : config_(std::move(config)), hooks_(std::move(hooks)), storage_(storage) {
+    : config_(ParseBootstrapConfig(std::move(config))),
+      hooks_(std::move(hooks)),
+      storage_(storage) {
   if (!hooks_.now)
     hooks_.now = [] {
       return std::chrono::duration_cast<std::chrono::seconds>(
@@ -200,26 +279,23 @@ Bootstrap::Bootstrap(Json::Value config, Hooks hooks, Storage storage)
           .count();
     };
   if (!hooks_.notice) hooks_.notice = [](const std::string&) {};
-  for (const auto* field :
-       {"allow_insecure_localhost", "allow_legacy_complete_404"})
-    if (config_.isMember(field) && !config_[field].isBool())
-      throw std::runtime_error("bootstrap flags must be boolean");
+  if (!hooks_.clock_readiness) hooks_.clock_readiness = ClockReadinessError;
   local_test_ = config_.get("allow_insecure_localhost", false).asBool();
-  for (const auto* field : {"gateway_url", "console_url"}) {
-    auto url = Text(config_, field, 2048);
-    if (!AllowedURL(url, local_test_))
-      throw std::runtime_error("HTTPS required");
-    while (url.back() == '/') url.pop_back();
-    config_[field] = url;
+  const auto runtime =
+      storage_.Read(config_["device_config"].asString(), true, 16384);
+  if (!runtime.isNull()) {
+    if (runtime["credentials_file"] !=
+        std::filesystem::absolute(config_["credentials_config"].asString())
+            .lexically_normal()
+            .string())
+      throw std::runtime_error(
+          "runtime requires the managed credentials file reference");
+    for (const auto& name : runtime.getMemberNames())
+      if (IsAuthConfigField(name))
+        throw std::runtime_error(
+            "runtime must not contain inline authentication");
   }
-  // Vehicle metadata is assigned by the administrator. Legacy configuration
-  // fields may remain on disk, but new enrollments do not use them.
-  for (const auto* field :
-       {"state_directory", "device_template", "device_config"})
-    Text(config_, field, 4096);
-  // Validate template and protected destination before issuing an enrollment.
-  (void)storage_.Read(config_["device_template"].asString(), false, 16384);
-  (void)storage_.Read(config_["device_config"].asString(), true, 16384);
+  (void)storage_.Read(config_["credentials_config"].asString(), true, 16384);
   const auto dir = config_["state_directory"].asString();
   lock_ = storage_.Lock(dir);
   try {
@@ -235,6 +311,9 @@ Bootstrap::Bootstrap(Json::Value config, Hooks hooks, Storage storage)
     private_key_ = DecodeBase64URL(Text(key, "private_key", 43), 32);
     state_ = storage_.Read(dir + "/enrollment.json", true);
     if (state_.isNull()) state_ = Json::Value(Json::objectValue);
+    for (const auto* field : {"name", "serial", "platform"})
+      if (state_.isMember(field))
+        throw std::runtime_error("retired enrollment metadata is not supported");
     if (state_.isMember("request_id") &&
         (!IsUUID(Text(state_, "request_id", 36)) ||
          state_["public_key"] != PublicKey(private_key_)))
@@ -246,8 +325,9 @@ Bootstrap::Bootstrap(Json::Value config, Hooks hooks, Storage storage)
       const auto code = Text(state_, "user_code", 9);
       if (!UserCode(code)) throw std::runtime_error("invalid saved user code");
       hooks_.notice(
-          "Enrollment code: " + code + "\nOpen " +
-          config_["console_url"].asString() +
+          "Enrollment code: " + code + "\nDevice fingerprint: " +
+          FormattedFingerprint(private_key_) + "\nOpen " +
+          state_.get("console_url", config_["gateway_url"]).asString() +
           "/#/admin; in vehicle management enter this code for approval.");
     }
   } catch (...) {
@@ -285,7 +365,14 @@ void Bootstrap::NewEnrollment() {
   last_diagnostic_key_.clear();
   Save();
 }
-Result Bootstrap::Wait(unsigned seconds) {
+Result Bootstrap::Wait(unsigned seconds, bool polling_jitter) {
+  if (seconds >= 5 && polling_jitter) {
+    unsigned jitter = 0;
+    if (RAND_bytes(reinterpret_cast<unsigned char*>(&jitter), sizeof(jitter)) !=
+        1)
+      throw std::runtime_error("random generator failed");
+    seconds += jitter % 3;
+  }
   state_["next_attempt_at"] = Json::Int64(hooks_.now() + seconds);
   Save();
   return {Status::Waiting,
@@ -315,7 +402,10 @@ Result Bootstrap::Retry(unsigned minimum, const std::string& code,
   if (RAND_bytes(reinterpret_cast<unsigned char*>(&random), sizeof(random)) !=
       1)
     throw std::runtime_error("random generator failed");
-  auto result = Wait(std::max(minimum, bound / 2 + random % (bound / 2 + 1)));
+  // Retry already chooses jitter within its backoff bound; do not add the
+  // normal polling jitter a second time.
+  auto result = Wait(std::max(minimum, bound / 2 + random % (bound / 2 + 1)),
+                     false);
   NotifyOnce(stage + ":" + resolved_code + ":" + std::to_string(http_status),
              "Bootstrap retry [" + stage + "]: code=" + resolved_code +
                  (http_status > 0 ? " http=" + std::to_string(http_status)
@@ -352,14 +442,6 @@ Response Bootstrap::Enrollment(const std::string& action) {
   Json::Value envelope(Json::objectValue);
   envelope["request_id"] = state_["request_id"];
   envelope["public_key"] = PublicKey(private_key_);
-  // Preserve signed metadata only when retrying a pre-upgrade create request.
-  // Dropping it for that request ID would break server-side idempotency.
-  if (action == "create") {
-    for (const auto* field : {"name", "serial", "platform"})
-      if (state_.isMember(field))
-        envelope[field] = Text(state_, field,
-                               std::string(field) == "name" ? 200 : 128, true);
-  }
   envelope["device_code"] =
       action == "create" ? "" : state_.get("device_code", "").asString();
   envelope["ticket"] =
@@ -400,7 +482,10 @@ Result Bootstrap::Authenticate(const Json::Value& device) {
         "http=" +
         std::to_string(token.status) +
         " (requesting same-vehicle recovery enrollment).");
+    const auto rejected_digest = CredentialDigest(device);
     NewEnrollment();
+    state_["rejected_credential_digest"] = rejected_digest;
+    Save();
     return Wait(5);
   }
   if (token.status != 200) {
@@ -438,6 +523,7 @@ Result Bootstrap::Authenticate(const Json::Value& device) {
               "active vehicle lifecycle in console",
         mapping.status);
   }
+  InstallConfiguration(MergeCredentials(device, device, local_test_));
   current_stage_ = "installation_complete";
   auto completed = Call("POST",
                         auth.gateway_url + "/api/vehicles/" + auth.vehicle_id +
@@ -448,9 +534,7 @@ Result Bootstrap::Authenticate(const Json::Value& device) {
                  ResponseErrorCode(completed, "GATEWAY_UNAVAILABLE"),
                  TransientHint(completed.status), completed.status);
   }
-  const bool legacy = !state_.isMember("request_id") &&
-                      config_.get("allow_legacy_complete_404", false).asBool();
-  if (completed.status != 204 && !(legacy && completed.status == 404)) {
+  if (completed.status != 204) {
     return Block(
         "installation_complete",
         ResponseErrorCode(completed, "INSTALLATION_COMPLETE_REJECTED"),
@@ -467,6 +551,16 @@ Result Bootstrap::Authenticate(const Json::Value& device) {
   state_.removeMember("ticket");
   state_.removeMember("ticket_expires_at");
   state_.removeMember("next_attempt_at");
+  state_.removeMember("pending_credentials");
+  state_.removeMember("rejected_credential_digest");
+  if (state_.get("credentials_updated", false).asBool()) {
+    hooks_.notice(
+        "Authentication acknowledged; credentials changed. A running runtime "
+        "reloads a changed secret only after explicit OAuth invalid_client. "
+        "If a restart is needed, do it manually at a safe maintenance stop; "
+        "no runtime was started or restarted.");
+    state_.removeMember("credentials_updated");
+  }
   Save();
   return {Status::Ready, 0, "installed", "",
           "vehicle authentication and installation acknowledged",
@@ -486,6 +580,16 @@ Result Bootstrap::Step() {
                 .asString(),
             state_.get("last_http_status", 0).asInt64()};
   }
+  if (hooks_.now() < 1700000000) {
+    return Block(
+        "clock_check", "CLOCK_NOT_SYNCHRONIZED",
+        "system clock is not synchronized (before 2023-11); synchronize "
+        "NTP/PTP before enrollment",
+        0);
+  }
+  const auto clock_error = hooks_.clock_readiness();
+  if (!clock_error.empty())
+    return Block("clock_check", "CLOCK_NOT_SYNCHRONIZED", clock_error, 0);
   auto next = state_.get("next_attempt_at", Json::Int64(0)).asInt64();
   if (next > hooks_.now())
     return {Status::Waiting,
@@ -510,17 +614,61 @@ Result Bootstrap::Step() {
 }
 
 Result Bootstrap::Advance() {
-  const auto path = config_["device_config"].asString();
+  if (!version_checked_) {
+    current_stage_ = "version_check";
+    const auto response = Call("GET", config_["gateway_url"].asString() +
+                                         "/api/v1/version");
+    if (Transient(response))
+      return Retry(5, "VERSION_CHECK_UNAVAILABLE",
+                   "Gateway compatibility check temporarily unavailable",
+                   response.status);
+    if (response.status != 200)
+      return Block("version_check", "GATEWAY_PROTOCOL_INCOMPATIBLE",
+                   "Gateway must expose enrollment protocol version 1",
+                   response.status);
+    Json::Value version;
+    try {
+      version = ParseHTTPJSON(response.body);
+    } catch (...) {
+      return Block("version_check", "GATEWAY_PROTOCOL_INCOMPATIBLE",
+                   "Gateway version response must be valid protocol metadata",
+                   response.status);
+    }
+    if (version["status"] != "ok" || version["protocol_version"] != "1" ||
+        version["enrollment_protocol"] != "teleop-enrollment-v1")
+      return Block("version_check", "GATEWAY_PROTOCOL_INCOMPATIBLE",
+                   "Gateway enrollment protocol does not match this SDK", 200);
+    version_checked_ = true;
+  }
+  const auto path = config_["credentials_config"].asString();
   auto device = storage_.Read(path, true, 16384);
+  const bool legacy_cross_origin =
+      HasCredentials(device) && !device.isMember("issuer") &&
+      !local_test_ &&
+      !TrustedTokenEndpoint(device["token_url"].asString(),
+                            config_["gateway_url"].asString(), "", false);
+  if (!device.isNull() && !legacy_cross_origin) {
+    Json::Value runtime(Json::objectValue);
+    runtime["credentials_file"] =
+        std::filesystem::absolute(path).lexically_normal().string();
+    (void)ResolveDeviceConfig(runtime, device);
+  }
   auto status = state_.get("status", "").asString();
-  if (HasCredentials(device) &&
-      (status.empty() || status == "installed" ||
-       (status == "installing" &&
-        (!state_.isMember("credential_digest") ||
-         state_["credential_digest"] == CredentialDigest(device)))))
+  if (status == "validating" && state_["pending_credentials"].isObject() &&
+      state_["credential_digest"] ==
+          CredentialDigest(state_["pending_credentials"])) {
+    return Authenticate(state_["pending_credentials"]);
+  }
+  if (HasCredentials(device) && !legacy_cross_origin &&
+      CredentialDigest(device) !=
+          state_.get("rejected_credential_digest", "").asString() &&
+      (status.empty() || status == "installed" || status == "installing" ||
+       status == "active" ||
+       state_["credential_digest"] == CredentialDigest(device)))
     return Authenticate(device);
   if (!state_.isMember("request_id") || status == "expired" ||
-      (status == "installed" && !HasCredentials(device))) {
+      (status == "installed" &&
+       (!HasCredentials(device) || legacy_cross_origin))) {
     NewEnrollment();
     status = "creating";
   }
@@ -592,17 +740,19 @@ Result Bootstrap::Advance() {
   state_["failures"] = 0;
   if (action == "complete") {
     Text(value, "issuer", 2048);
-    auto merged = MergeDevice(
-        storage_.Read(config_["device_template"].asString(), false, 16384),
-        storage_.Read(path, true, 16384), value, local_test_);
-    // Installing is durable before the credential file; a crash in this gap
-    // retries the same key-bound ticket rather than losing the issued secret.
-    state_["status"] = "installing";
-    state_["stage"] = "installing";
+    auto merged = MergeCredentials(device, value, local_test_);
+    if (merged["gateway_url"] != config_["gateway_url"])
+      throw std::runtime_error(
+          "redeemed gateway_url does not match configured gateway_url");
+    // Validating is durable inside enrollment.json before replacing active
+    // credentials; active credentials are written only after OAuth and Gateway
+    // device-auth-check succeed.
+    state_["status"] = "validating";
+    state_["stage"] = "candidate_validation";
     ClearError();
     state_["credential_digest"] = CredentialDigest(merged);
+    state_["pending_credentials"] = merged;
     Save();
-    storage_.Write(path, merged);
     return Wait(0);
   }
   if (!IsUUID(Text(value, "id", 36)))
@@ -626,6 +776,11 @@ Result Bootstrap::Advance() {
       throw std::runtime_error("invalid enrollment codes");
     state_["device_code"] = code;
     state_["user_code"] = user;
+    auto console = Text(value, "console_url", 2048);
+    if (!AllowedURL(console, local_test_))
+      throw std::runtime_error("invalid enrollment console endpoint");
+    while (console.size() > 1 && console.back() == '/') console.pop_back();
+    state_["console_url"] = console;
   }
   if (remote == "denied") {
     const std::string hint =
@@ -671,15 +826,18 @@ Result Bootstrap::Advance() {
   if (remote == "active") {
     // Active is not evidence that this machine has credentials. Missing local
     // secrets require human-approved same-key recovery on the original vehicle.
-    if (HasCredentials(device)) {
+    if (HasCredentials(device) && !legacy_cross_origin &&
+        CredentialDigest(device) !=
+            state_.get("rejected_credential_digest", "").asString()) {
       state_["status"] = "installing";
       state_["stage"] = "installing";
       Save();
-      return Wait(5);
+      return Authenticate(device);
     }
     hooks_.notice(
         "Enrollment is marked active on server but local credentials are "
-        "missing; requesting same-vehicle recovery enrollment.");
+        "missing or require issuer-bound upgrade; requesting same-vehicle "
+        "recovery enrollment with administrator approval.");
     NewEnrollment();
     return Wait(5);
   }
@@ -694,14 +852,63 @@ Result Bootstrap::Advance() {
   }
   if (action == "create" && state_.isMember("user_code"))
     hooks_.notice(
-        "Enrollment code: " + state_["user_code"].asString() + "\nOpen " +
-        config_["console_url"].asString() +
+        "Enrollment code: " + state_["user_code"].asString() +
+        "\nDevice fingerprint: " + FormattedFingerprint(private_key_) +
+        "\nOpen " + state_["console_url"].asString() +
         "/#/admin; in vehicle management enter this code for approval.");
   if (remote == "awaiting_install" &&
       state_["ticket_expires_at"].asInt64() > hooks_.now()) {
     return Wait(0);
   }
   return Wait(interval);
+}
+
+void Bootstrap::InstallConfiguration(const Json::Value& credentials) {
+  const auto path = config_["device_config"].asString();
+  const auto auth_path = config_["credentials_config"].asString();
+  const auto reference =
+      std::filesystem::absolute(auth_path).lexically_normal().string();
+  auto existing = storage_.Read(path, true, 16384);
+  Json::Value runtime = existing;
+  if (runtime.isNull()) {
+    runtime = Json::Value(Json::objectValue);
+    runtime["control_mode"] = "disabled";
+    runtime["media_enabled"] = false;
+    runtime["task_mode"] = "disabled";
+  }
+  if (!existing.isNull()) {
+    if (runtime["credentials_file"] != reference)
+      throw std::runtime_error(
+          "runtime credentials file does not match bootstrap");
+    for (const auto& name : runtime.getMemberNames())
+      if (IsAuthConfigField(name))
+        throw std::runtime_error(
+            "runtime must not contain inline authentication");
+  }
+  runtime["credentials_file"] = reference;
+  (void)ResolveDeviceConfig(runtime, credentials);
+  if (JSON(runtime).size() + 1 > 16384)
+    throw std::runtime_error("runtime device configuration exceeds 16 KiB");
+  // Credentials precede the reference. A crash between writes is repaired by
+  // the next self-check, before acknowledging installation.
+  const auto previous_credentials = storage_.Read(auth_path, true, 16384);
+  if (previous_credentials != credentials) {
+    if (!previous_credentials.isNull()) {
+      state_["credentials_updated"] = true;
+      Save();
+    }
+    storage_.Write(auth_path, credentials);
+  }
+  if (runtime != existing) {
+    storage_.Write(path, runtime);
+    hooks_.notice("Created safe runtime defaults; control remains disabled.");
+  }
+  state_.removeMember("pending_credentials");
+  state_.removeMember("rejected_credential_digest");
+  state_["status"] = "installing";
+  state_["stage"] = "installation_complete";
+  state_["credential_digest"] = CredentialDigest(credentials);
+  Save();
 }
 }  // namespace enrollment
 }  // namespace vehicle_edge

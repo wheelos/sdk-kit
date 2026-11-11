@@ -12,6 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+#include "vehicle_edge/media_backend.h"
+
 #include <poll.h>
 #include <signal.h>
 #include <sys/prctl.h>
@@ -21,7 +23,6 @@
 #include <algorithm>
 #include <chrono>
 #include <cstring>
-#include <fstream>
 #include <iostream>
 #include <memory>
 #include <stdexcept>
@@ -33,7 +34,6 @@
 
 #include "vehicle_edge/auth_client.h"
 #include "vehicle_edge/encoded_video.h"
-#include "vehicle_edge/media_backend.h"
 
 namespace vehicle_edge {
 namespace {
@@ -126,17 +126,7 @@ MediaWorkerConfig ParseMediaWorkerConfig(const Json::Value &root) {
 }
 
 MediaWorkerConfig LoadMediaWorkerConfig(const std::string &path) {
-  std::ifstream input(path);
-  if (!input) {
-    throw std::runtime_error("cannot open config file: " + path);
-  }
-  Json::CharReaderBuilder builder;
-  Json::Value root;
-  std::string errors;
-  if (!Json::parseFromStream(builder, input, &root, &errors)) {
-    throw std::invalid_argument("invalid JSON config: " + errors);
-  }
-  return ParseMediaWorkerConfig(root);
+  return ParseMediaWorkerConfig(LoadDeviceConfigJSON(path));
 }
 
 } // namespace vehicle_edge

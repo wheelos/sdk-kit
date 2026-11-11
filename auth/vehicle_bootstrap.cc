@@ -18,12 +18,15 @@
 #include <unistd.h>
 
 #include <algorithm>
+#include <cerrno>
 #include <chrono>
 #include <exception>
+#include <filesystem>
 #include <iostream>
 #include <string>
 #include <thread>
 
+#include "vehicle_edge/auth_config.h"
 #include "vehicle_edge/bootstrap.h"
 
 namespace {
@@ -39,13 +42,24 @@ bool SafeDiagnosticText(const std::string& text) {
 }  // namespace
 
 int main(int argc, char** argv) {
-  if (argc != 3 || std::string(argv[1]) != "--config") {
+  const bool check = argc == 4 && std::string(argv[1]) == "--check-config" &&
+                     std::string(argv[2]) == "--gateway-url";
+  const bool configure = argc == 4 && std::string(argv[1]) == "--configure" &&
+                         std::string(argv[2]) == "--gateway-url";
+  const bool enroll = argc == 3 && std::string(argv[1]) == "--gateway-url";
+  const bool run =
+      argc == 1 || (argc == 3 && std::string(argv[1]) == "--config");
+  if (!check && !configure && !enroll && !run) {
     std::cerr
-        << "Usage: vehicle_bootstrap --config /etc/teleop/bootstrap.json\n";
+        << "Usage: vehicle_bootstrap [--config /etc/teleop/bootstrap.json]\n"
+        << "       vehicle_bootstrap --configure|--check-config "
+           "--gateway-url HTTPS_URL\n"
+        << "       vehicle_bootstrap --gateway-url HTTPS_URL\n";
     return 78;
   }
-  if (geteuid() != 0) {
-    std::cerr << "Bootstrap requires root-owned protected storage.\n";
+  if (geteuid() != 0 && !(run && argc == 3)) {
+    std::cerr << "Non-root bootstrap requires --config with protected "
+                 "current-user-owned paths.\n";
     return 78;
   }
   const rlimit no_core{0, 0};
@@ -57,11 +71,57 @@ int main(int argc, char** argv) {
   signal(SIGINT, Cancel);
   try {
     vehicle_edge::enrollment::Storage storage;
+    const int gateway_arg = (check || configure) ? 3 : 2;
+    if ((check || configure || enroll) &&
+        !vehicle_edge::AllowedURL(argv[gateway_arg], false))
+      throw std::runtime_error("configuration endpoints require HTTPS");
+    if (check) {
+      Json::Value config(Json::objectValue);
+      if (access("/etc/teleop", F_OK) == 0)
+        config = storage.Read("/etc/teleop/bootstrap.json", true, 16384);
+      else if (errno != ENOENT)
+        throw std::runtime_error("cannot inspect bootstrap configuration");
+      if (config.isNull()) config = Json::Value(Json::objectValue);
+      config["gateway_url"] = argv[gateway_arg];
+      (void)vehicle_edge::enrollment::ParseBootstrapConfig(config);
+      return 0;
+    }
+    if (run && argc == 3) {
+      const auto config = vehicle_edge::enrollment::ParseBootstrapConfig(
+          storage.Read(argv[2]));
+      storage.EnsureDirectory(config["state_directory"].asString());
+      storage.EnsureDirectory(std::filesystem::path(
+          config["device_config"].asString()).parent_path().string());
+      storage.EnsureDirectory(std::filesystem::path(
+          config["credentials_config"].asString()).parent_path().string());
+    } else {
+    storage.EnsureDirectory("/etc/teleop");
+    storage.EnsureDirectory("/var/lib/teleop/bootstrap");
+    }
+    if (configure || enroll) {
+      const int lock = storage.Lock("/var/lib/teleop/bootstrap");
+      try {
+        auto config = storage.Read("/etc/teleop/bootstrap.json", true, 16384);
+        if (config.isNull()) config = Json::Value(Json::objectValue);
+        config["gateway_url"] = argv[gateway_arg];
+        (void)vehicle_edge::enrollment::ParseBootstrapConfig(config);
+        storage.Write("/etc/teleop/bootstrap.json", config);
+      } catch (...) {
+        close(lock);
+        throw;
+      }
+      close(lock);
+      std::cout << "Bootstrap address saved; existing keys and runtime "
+                   "settings are unchanged.\n";
+      if (configure) return 0;
+    }
     vehicle_edge::enrollment::Hooks hooks;
     hooks.notice = [](const std::string& message) {
       std::cout << message << std::endl;
     };
-    vehicle_edge::enrollment::Bootstrap bootstrap(storage.Read(argv[2]), hooks);
+    vehicle_edge::enrollment::Bootstrap bootstrap(
+        storage.Read(run && argc == 3 ? argv[2] : "/etc/teleop/bootstrap.json"),
+        hooks, storage);
     while (!cancelled) {
       auto result = bootstrap.Step();
       using vehicle_edge::enrollment::Status;

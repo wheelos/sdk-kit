@@ -1,6 +1,7 @@
-# `livekit_sdk@1.13.0` 构建与 BCR 模块生成文档
+# `livekit_sdk@1.13.0` 构建与 BCR 平台拆分
 
-`data/bazel-central-registry/modules/livekit_sdk/1.13.0` 是如何从官方发布包与 Rust FFI 补丁构建生成的完整说明。
+本文说明 `livekit_sdk@1.13.0` 的 Rust FFI 补丁，以及本地 BCR 中按 Linux 架构选择 SDK 的实现。
+本地 BCR 的 `1.13.0` 由 WheelOS 平台归档提供 x86_64 和 AArch64 SDK。
 
 ---
 
@@ -8,12 +9,14 @@
 
 `@livekit_sdk//:livekit_sdk` 由两部分组成：
 
-1. **官方预编译 C++ SDK 基础包（`include/livekit/*.h` + `lib/liblivekit.so`）**
-   - 来源：`https://github.com/livekit/client-sdk-cpp/releases/download/v1.13.0/livekit-sdk-ubuntu-22.04-x64-1.13.0.tar.gz`
-   - SHA256：`60712578e14350689beeff36675088c8b91c1050b906441f71db312089fe8fa8`
-   - SRI Integrity：`sha256-YHEleOFDUGib7v82Z1CIyLkcEFC5BkQfcdsxIIn+j6g=`
+1. **按平台发布的 SDK 归档（包含头文件及补丁版 `.so`）**
+   - x86_64：`https://dl.wheelos.cn/release/public/livekit_sdk/1.13.0/linux-x86_64/livekit-sdk-1.13.0-linux-x86_64.tar.gz`
+   - x86_64 SHA256：`c713ebc7f67e40a85baeaa0acc19e4e96d10042a0f7bd6639f3db1bff53f795a`
+   - AArch64：`https://dl.wheelos.cn/release/public/livekit_sdk/1.13.0/linux-aarch64/livekit-sdk-1.13.0-linux-aarch64.tar.gz`
+   - AArch64 SHA256：`a5edbd476a4ca4f7c34a682c22e9b7b901a008400adb596fc4c89d4614ad50b5`
+   - 两个归档均包含 `include/livekit/`、`lib/liblivekit.so` 和补丁版 `lib/liblivekit_ffi.so`。BCR 只保存带校验值的下载规则，不再保存 FFI `.so` 文件。
 
-2. **修复了纯 DataChannel 发送方身份识别的 `lib/liblivekit_ffi.so`（Overlay 覆盖）**
+2. **补丁版 Rust FFI 的来源**
    - **为什么需要补丁**：
      在 LiveKit SFU 中，远程驾驶前端（浏览器控制端）仅通过 DataChannel 发送控制包（不发布音视频 Track）。SFU 会对非媒体发布者的 `ParticipantUpdate` 信令做批处理延迟下发；当首个 `vehicle.control.v2` 数据包到达车端时，`livekit-ffi`（Rust 层 `RoomInner::handle_data`）若尚未在本地 `participants` 表中查到该远端参与者，会将 `event.participant` 置为 `None`，导致车端 `ControlReceiver` 无法校验 `event.participant->identity() == expected_sender_id`。
    - **补丁内容**：
@@ -27,12 +30,12 @@
 ## 2. 编译生成补丁版 `liblivekit_ffi.so` 的完整步骤
 
 ### 2.1 环境依赖
-- Ubuntu 22.04 x86_64
+- Ubuntu 22.04 x86_64 或 AArch64 原生构建环境
 - Rust 工具链（`cargo` / `rustc`）
 - `cmake >= 3.20`、`patch`、`tar`、`protobuf-compiler` (`protoc`)、`clang`/`llvm-dev`
 
 ### 2.2 一键复现编译命令
-直接调用本目录下的 `LiveKitFFIPatch.cmake` 脚本即可自动下载固定 commit 的源码、校验 SHA256、打补丁并编译出 `liblivekit_ffi.so`：
+直接调用本目录下的 `LiveKitFFIPatch.cmake` 脚本即可自动下载固定 commit 的源码、校验 SHA256、打补丁并编译出当前主机架构的 `liblivekit_ffi.so`。分别在 x86_64 和 AArch64 原生环境构建，将匹配架构的 SDK 归档发布到 WheelOS 下载服务；不要把 `.so` 放入 BCR 仓库。
 
 ```bash
 WORK_DIR=/tmp/livekit-ffi-build
@@ -60,42 +63,33 @@ cmake \
 
 ---
 
-## 3. 生成 `data/bazel-central-registry/modules/livekit_sdk/1.13.0` 的步骤
+## 3. BCR 平台选择与修订文件
 
-将编译好的 `liblivekit_ffi.so` 放入 BCR 模块的 `overlay/lib/` 目录，并计算 SRI（`sha256-<base64>`）写入 `source.json`：
+规则位于 `data/bazel-central-registry/modules/livekit_sdk/1.13.0`。它为 x86_64
+和 AArch64 声明对称的 `livekit_linux_<arch>` 外部仓库，分别固定归档 URL、SHA256。
+两边均导出 `livekit_sdk` 与 `runtime_libs`，模块顶层再按
+`@platforms//cpu` 和 `@platforms//os:linux` 自动选择；其他平台标记为不兼容。
+
+LiveKit 二进制归档由 WheelOS 发布服务托管，BCR overlay 中不存放 `.so`。如需更新 Bazel
+规则，计算 overlay 文件的 SRI（`sha256-<base64>`）并同步写入 `source.json`：
 
 ```bash
 BCR_MOD=/home/wfh/01code/apollo-base/data/bazel-central-registry/modules/livekit_sdk/1.13.0
 
-# 1. 拷贝补丁后的 liblivekit_ffi.so 到 overlay/lib/
-mkdir -p "${BCR_MOD}/overlay/lib"
-cp -f /tmp/livekit-ffi-build/liblivekit_ffi.so "${BCR_MOD}/overlay/lib/liblivekit_ffi.so"
-
-# 2. 计算各文件的 SRI 哈希 (sha256-<base64>)
+# 计算各 overlay 文件的 SRI 哈希 (sha256-<base64>)
 sri_hash() {
   echo "sha256-$(openssl dgst -sha256 -binary "$1" | openssl base64 -A)"
 }
 
-echo "BUILD.bazel:        $(sri_hash "${BCR_MOD}/overlay/BUILD.bazel")"
-echo "MODULE.bazel:       $(sri_hash "${BCR_MOD}/overlay/MODULE.bazel")"
-echo "liblivekit_ffi.so:  $(sri_hash "${BCR_MOD}/overlay/lib/liblivekit_ffi.so")"
+for file in BUILD.bazel MODULE.bazel livekit_repositories.bzl sdk.BUILD.bazel; do
+  echo "${file}: $(sri_hash "${BCR_MOD}/overlay/${file}")"
+done
 ```
 
-最终生成的 `modules/livekit_sdk/1.13.0/source.json` 结构如下：
+最终的 `modules/livekit_sdk/1.13.0/source.json` 记录 BCR 基础归档及 overlay
+文件的完整性值；平台 SDK 归档则由固定 SHA256 的外部仓库规则获取。不要改写已发布版本目录，
+该本地开发注册表按要求直接将平台选择规则放入 `1.13.0`。
 
-```json
-{
-    "url": "https://github.com/livekit/client-sdk-cpp/releases/download/v1.13.0/livekit-sdk-ubuntu-22.04-x64-1.13.0.tar.gz",
-    "integrity": "sha256-YHEleOFDUGib7v82Z1CIyLkcEFC5BkQfcdsxIIn+j6g=",
-    "strip_prefix": "livekit-sdk-ubuntu-22.04-x64-1.13.0",
-    "overlay": {
-        "BUILD.bazel": "sha256-Rd2t/lxhcOOcMdYgu7gSJBlvrnhyKNtT3uvxTgWcpQ8=",
-        "MODULE.bazel": "sha256-tX4rdeyqPvngwgg/vDq3ppqCENDc61XlKpW2KgXty6g=",
-        "lib/liblivekit_ffi.so": "sha256-kzWLcHPXG8nDcI064Ezgx85HyClEmeihu9GRLr1wgLg="
-    }
-}
-```
-
-当 Bazel 拉取 `@livekit_sdk` 时：
-1. 自动下载并解压官方 `livekit-sdk-ubuntu-22.04-x64-1.13.0.tar.gz`（提供 `include/livekit/**` 与 `lib/liblivekit.so`）。
-2. 自动用 `overlay/` 中的 `BUILD.bazel`、`MODULE.bazel` 和补丁版 `lib/liblivekit_ffi.so` 覆盖解压目录中的同名文件。
+构建时，`@livekit_sdk//:livekit_sdk` 和 `@livekit_sdk//:runtime_libs` 根据目标平台自动选择
+`livekit_linux_x86_64` 或 `livekit_linux_aarch64`。对应仓库下载固定校验的远程归档；
+其他操作系统和 CPU 架构不兼容。

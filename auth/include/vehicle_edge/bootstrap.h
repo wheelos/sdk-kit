@@ -15,6 +15,7 @@
 #pragma once
 
 #include <sys/types.h>
+#include <unistd.h>
 
 #include <cstdint>
 #include <exception>
@@ -49,21 +50,23 @@ std::string Canonical(const std::string& action, const Json::Value& envelope);
 Json::Value Sign(const std::string& action, Json::Value envelope,
                  const std::string& private_key);
 
-// Owner injection is for unprivileged isolated tests; the CLI always uses root.
 class Storage {
  public:
-  explicit Storage(uid_t owner = 0) : owner_(owner) {}
+  explicit Storage(uid_t owner = geteuid()) : owner_(owner) {}
   Json::Value Read(const std::string& path, bool optional = false,
                    std::size_t limit = 65536) const;
   void Write(const std::string& path, const Json::Value& value) const;
+  void EnsureDirectory(const std::string& path) const;
+  void Remove(const std::string& path) const;
   int Lock(const std::string& directory) const;
 
  private:
   uid_t owner_;
 };
 
-Json::Value MergeDevice(const Json::Value& base, const Json::Value& existing,
-                        const Json::Value& credentials, bool local_test);
+Json::Value MergeCredentials(const Json::Value& existing,
+                             const Json::Value& credentials, bool local_test);
+Json::Value ParseBootstrapConfig(Json::Value config);
 bool InvalidCredentials(const Response& response);
 
 enum class Status { Waiting, Ready, Denied, Blocked };
@@ -78,6 +81,7 @@ struct Result {
 struct Hooks {
   std::function<Response(const Request&)> request = Send;
   std::function<std::int64_t()> now;
+  std::function<std::string()> clock_readiness;
   std::function<void(const std::string&)> notice;
 };
 
@@ -89,7 +93,7 @@ class Bootstrap {
 
  private:
   Result Advance();
-  Result Wait(unsigned seconds);
+  Result Wait(unsigned seconds, bool polling_jitter = true);
   Result Retry(unsigned minimum = 5, const std::string& code = "",
                const std::string& hint = "", long http_status = 0);
   Result Block(const std::string& stage, const std::string& code,
@@ -103,6 +107,7 @@ class Bootstrap {
                 const std::string& type = "application/json");
   Response Enrollment(const std::string& action);
   Result Authenticate(const Json::Value& device);
+  void InstallConfiguration(const Json::Value& credentials);
 
   Json::Value config_, state_;
   Hooks hooks_;
@@ -113,6 +118,7 @@ class Bootstrap {
   int lock_ = -1;
   unsigned failures_ = 0;
   bool local_test_ = false;
+  bool version_checked_ = false;
 };
 
 }  // namespace enrollment

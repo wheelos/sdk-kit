@@ -41,12 +41,15 @@ class FD {
 void CheckFile(int fd, uid_t owner) {
   struct stat s{};
   if (fstat(fd, &s) || !S_ISREG(s.st_mode) || s.st_uid != owner ||
-      (s.st_mode & 07777) != 0600 || s.st_nlink != 1 || s.st_size > 65536)
+      ((s.st_mode & 07777) != 0600 &&
+       !((s.st_mode & 07777) == 0640 && owner == 0 && s.st_gid != 0)) ||
+      s.st_nlink != 1 || s.st_size > 65536)
     throw std::runtime_error(
         "protected file requires owner, 0600 and one link");
 }
 // Resolve every directory component without following symlinks.
-int Directory(const std::string& path, uid_t owner) {
+int Directory(const std::string& path, uid_t owner, bool create = false) {
+  if (path.empty()) throw std::runtime_error("empty storage directory");
   int current =
       open(path.front() == '/' ? "/" : ".", O_RDONLY | O_DIRECTORY | O_CLOEXEC);
   if (current < 0) throw std::runtime_error("cannot open storage directory");
@@ -68,10 +71,22 @@ int Directory(const std::string& path, uid_t owner) {
       close(current);
       throw std::runtime_error("parent traversal forbidden");
     }
+    if (create && mkdirat(current, part.c_str(), 0700) && errno != EEXIST) {
+      close(current);
+      throw std::runtime_error("cannot create protected directory");
+    }
     int next = openat(current, part.c_str(),
                       O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+    if (next < 0) {
+      close(current);
+      throw std::runtime_error("cannot open storage directory");
+    }
+    if (create && fsync(current)) {
+      close(current);
+      close(next);
+      throw std::runtime_error("cannot persist protected directory");
+    }
     close(current);
-    if (next < 0) throw std::runtime_error("cannot open storage directory");
     struct stat s{};
     if (fstat(next, &s) || (s.st_uid != 0 && s.st_uid != owner) ||
         (s.st_mode & 0022)) {
@@ -95,6 +110,37 @@ std::pair<std::string, std::string> Split(const std::string& path) {
           name};
 }
 }  // namespace
+
+void Storage::EnsureDirectory(const std::string& path) const {
+  if (geteuid() != owner_) throw std::runtime_error("incorrect storage owner");
+  FD directory(Directory(path, owner_, true));
+  struct stat s {};
+  if (fstat(directory.get(), &s) || s.st_uid != owner_ ||
+      ((s.st_mode & 07777) != 0700 &&
+       !((s.st_mode & 07777) == 0750 && owner_ == 0 && s.st_gid != 0)) ||
+      fsync(directory.get()))
+    throw std::runtime_error("cannot protect storage directory");
+}
+
+void Storage::Remove(const std::string& path) const {
+  if (geteuid() != owner_) throw std::runtime_error("incorrect storage owner");
+  auto parts = Split(path);
+  int dir_fd = -1;
+  try {
+    dir_fd = Directory(parts.first, owner_);
+  } catch (const std::runtime_error&) {
+    if (errno == ENOENT) return;
+    throw;
+  }
+  FD dir(dir_fd);
+  int raw = openat(dir.get(), parts.second.c_str(),
+                   O_RDONLY | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC);
+  if (raw < 0 && errno == ENOENT) return;
+  FD file(raw);
+  CheckFile(file.get(), owner_);
+  if (unlinkat(dir.get(), parts.second.c_str(), 0) || fsync(dir.get()))
+    throw std::runtime_error("cannot remove protected file");
+}
 
 Json::Value Storage::Read(const std::string& path, bool optional,
                           std::size_t limit) const {
@@ -126,9 +172,16 @@ void Storage::Write(const std::string& path, const Json::Value& value) const {
   FD dir(Directory(parts.first, owner_));
   int existing = openat(dir.get(), parts.second.c_str(),
                         O_RDONLY | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC);
+  mode_t mode = 0600;
+  gid_t group = getegid();
   if (existing >= 0) {
     FD old(existing);
     CheckFile(old.get(), owner_);
+    struct stat previous {};
+    if (fstat(old.get(), &previous))
+      throw std::runtime_error("cannot inspect protected destination");
+    mode = previous.st_mode & 07777;
+    group = previous.st_gid;
   } else if (errno != ENOENT) {
     throw std::runtime_error("unsafe destination");
   }
@@ -140,6 +193,8 @@ void Storage::Write(const std::string& path, const Json::Value& value) const {
   FD file(openat(dir.get(), name.c_str(),
                  O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, 0600));
   try {
+    if (fchown(file.get(), owner_, group) || fchmod(file.get(), mode))
+      throw std::runtime_error("cannot preserve protected file ownership");
     std::size_t offset = 0;
     while (offset < text.size()) {
       auto size = write(file.get(), text.data() + offset, text.size() - offset);

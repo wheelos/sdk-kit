@@ -47,10 +47,15 @@ endif()
 function(submodule name url sha directory strip)
   set(tar "${EDGE_FFI_WORK}/${name}.tar.gz")
   if(NOT EXISTS "${tar}")
-    file(DOWNLOAD "${url}" "${tar}" TLS_VERIFY ON EXPECTED_HASH "SHA256=${sha}")
+    file(DOWNLOAD "${url}" "${tar}" TLS_VERIFY ON STATUS download_status)
+    list(GET download_status 0 download_code)
+    if(NOT download_code EQUAL 0)
+      message(FATAL_ERROR "Cannot download pinned ${name}: ${download_status}")
+    endif()
   endif()
   file(SHA256 "${tar}" actual)
-  if(NOT actual STREQUAL sha)
+  set(accepted_hashes "${sha}" ${ARGN})
+  if(NOT actual IN_LIST accepted_hashes)
     message(FATAL_ERROR "Pinned ${name} source hash mismatch")
   endif()
   if(NOT EXISTS "${directory}/CMakeLists.txt" AND NOT EXISTS "${directory}/go.mod")
@@ -68,8 +73,9 @@ submodule(protocol
   "${source}/livekit-protocol/protocol" 1)
 submodule(libyuv
   "https://chromium.googlesource.com/libyuv/libyuv/+archive/917276084a49be726c90292ff0a6b0a3d571a6af.tar.gz"
-  eaf0d447eb2ce4a5eab6e4a9af53a81f551bd36bca06e9441e28e6cb54b28e8d
-  "${source}/yuv-sys/libyuv" 0)
+  1fbd0d6d4ab1b212a8a05f94165f86ab5eaaf0aaa77d64f5e1b561835091d6bf
+  "${source}/yuv-sys/libyuv" 0
+  eaf0d447eb2ce4a5eab6e4a9af53a81f551bd36bca06e9441e28e6cb54b28e8d)
 execute_process(COMMAND "${CMAKE_COMMAND}" -E env --unset=MAKEFLAGS
   "CARGO_TARGET_DIR=${EDGE_FFI_WORK}/target"
   "${EDGE_CARGO}" build --quiet --locked --release -p livekit-ffi

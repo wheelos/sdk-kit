@@ -25,8 +25,10 @@ struct AuthConfig {
   std::string vehicle_id;
   std::string gateway_url;
   std::string token_url;
+  std::string issuer;
   std::string client_id;
   std::string client_secret;
+  std::string credentials_file;
   bool allow_insecure_localhost = false;
 
   bool IsLocalSimDebug() const noexcept {
@@ -37,7 +39,17 @@ struct AuthConfig {
 bool ValidIdentifier(const std::string &value);
 bool LoopbackURL(const std::string &url);
 bool AllowedURL(const std::string &url, bool allow_insecure_localhost);
+std::string ClockReadinessError();
+std::string ClockDisciplineError(int state, int status, long maxerror);
+bool TrustedTokenEndpoint(const std::string &token_url,
+                          const std::string &gateway_url,
+                          const std::string &issuer,
+                          bool allow_insecure_localhost);
 Json::Value LoadProtectedJSON(const std::string &path);
+bool IsAuthConfigField(const std::string &name);
+Json::Value ResolveDeviceConfig(const Json::Value &runtime,
+                                const Json::Value &credentials);
+Json::Value LoadDeviceConfigJSON(const std::string &path);
 AuthConfig ParseAuthConfig(const Json::Value &value);
 AuthConfig LoadAuthConfig(const std::string &path);
 
