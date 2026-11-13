@@ -37,6 +37,8 @@ struct EncodedFrame {
   std::uint32_t width = 0;
   std::uint32_t height = 0;
   std::int64_t timestamp_us = 0;
+  // Unix microseconds at appsink read; zero means unavailable.
+  std::int64_t capture_time_us = 0;
   bool keyframe = false;
   std::uint64_t sequence = 0;
   std::uint32_t camera_index = 0;

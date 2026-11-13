@@ -71,7 +71,8 @@ bool ValidEncodedFrame(const EncodedFrame &frame) {
   if (frame.camera_index >= kMaxCameraStreams || frame.data.empty() ||
       frame.data.size() > kMaxEncodedBytes || frame.width == 0 ||
       frame.width > 4096 || frame.height == 0 || frame.height > 4096 ||
-      frame.timestamp_us <= 0 || !StartCode(frame.data, 0))
+      frame.timestamp_us <= 0 || frame.capture_time_us < 0 ||
+      !StartCode(frame.data, 0))
     return false;
   bool sps = false, pps = false, idr = false, slice = false;
   for (std::size_t i = 0; i < frame.data.size();) {
@@ -209,6 +210,8 @@ bool SendEncodedFrame(int fd, const EncodedFrame &frame) {
   header["width"] = frame.width;
   header["height"] = frame.height;
   header["timestamp_us"] = Json::Int64(frame.timestamp_us);
+  if (frame.capture_time_us > 0)
+    header["capture_time_us"] = Json::Int64(frame.capture_time_us);
   header["keyframe"] = frame.keyframe;
   header["sequence"] = Json::UInt64(frame.sequence);
   header["camera_index"] = frame.camera_index;
@@ -243,6 +246,9 @@ std::optional<EncodedFrame> ReceiveEncodedFrame(int fd) {
       !header["height"].isUInt() || !header["timestamp_us"].isInt64() ||
       !header["keyframe"].isBool() || !header["sequence"].isUInt64() ||
       !header["sent_at_ns"].isInt64() || header["sequence"].asUInt64() == 0 ||
+      (header.isMember("capture_time_us") &&
+       (!header["capture_time_us"].isInt64() ||
+        header["capture_time_us"].asInt64() <= 0)) ||
       (header.isMember("camera_index") && !header["camera_index"].isUInt()))
     throw std::runtime_error("invalid encoded metadata");
   const auto sent =
@@ -254,6 +260,8 @@ std::optional<EncodedFrame> ReceiveEncodedFrame(int fd) {
   frame.width = header["width"].asUInt();
   frame.height = header["height"].asUInt();
   frame.timestamp_us = header["timestamp_us"].asInt64();
+  if (header.isMember("capture_time_us"))
+    frame.capture_time_us = header["capture_time_us"].asInt64();
   frame.keyframe = header["keyframe"].asBool();
   frame.sequence = header["sequence"].asUInt64();
   frame.camera_index =

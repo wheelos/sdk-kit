@@ -113,6 +113,9 @@ void Validation() {
   frame.data.resize(kMaxEncodedBytes + 1);
   Require(!ValidEncodedFrame(frame), "oversized AU accepted");
   frame = Frame(1);
+  frame.capture_time_us = -1;
+  Require(!ValidEncodedFrame(frame), "negative capture time accepted");
+  frame = Frame(1);
   frame.data.push_back(0);
   frame.data.push_back(0);
   frame.data.push_back(1);
@@ -127,13 +130,20 @@ void IPC() {
     Require(!ReceiveEncodedFrame(sockets[1]), "empty channel produced frame");
     auto frame = Frame(1);
     frame.camera_index = 2;
+    frame.capture_time_us = 1700000000123456;
     Require(SendEncodedFrame(sockets[0], frame), "frame send failed");
     const auto received = ReceiveEncodedFrame(sockets[1]);
     Require(received && received->data == frame.data &&
                 received->timestamp_us == 1 && received->keyframe &&
                 received->width == 640 && received->sequence == 1 &&
-                received->camera_index == 2,
+                received->camera_index == 2 &&
+                received->capture_time_us == frame.capture_time_us,
             "IPC metadata or payload corrupted");
+    frame.capture_time_us = 0;
+    Require(SendEncodedFrame(sockets[0], frame), "legacy frame send failed");
+    const auto legacy = ReceiveEncodedFrame(sockets[1]);
+    Require(legacy && legacy->capture_time_us == 0,
+            "frame without capture time was not preserved");
     Require(SendVideoFeedback(sockets[1], {true, 500000, 15}),
             "feedback send failed");
     const auto feedback = ReceiveVideoFeedback(sockets[0]);

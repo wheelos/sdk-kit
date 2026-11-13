@@ -366,8 +366,22 @@ int vehicle_edge::RunMediaBackend(const MediaWorkerConfig &config) {
       } else {
         source = std::make_shared<livekit::VideoSource>(640, 480);
       }
-      auto track = participant->publishVideoTrack(
-          name, source, livekit::TrackSource::SOURCE_CAMERA);
+      std::shared_ptr<livekit::LocalVideoTrack> track;
+      if (encoded) {
+        track = livekit::LocalVideoTrack::createLocalVideoTrack(name, source);
+        livekit::TrackPublishOptions publish_options;
+        publish_options.source = livekit::TrackSource::SOURCE_CAMERA;
+        publish_options.video_encoder =
+            livekit::VideoEncoderBackend::PreEncoded;
+        publish_options.video_codec = livekit::VideoCodec::H264;
+        publish_options.simulcast = false;
+        publish_options.frame_metadata_features.emplace();
+        publish_options.frame_metadata_features->user_timestamp = true;
+        participant->publishTrack(track, publish_options);
+      } else {
+        track = participant->publishVideoTrack(
+            name, source, livekit::TrackSource::SOURCE_CAMERA);
+      }
       if (!track)
         throw std::runtime_error("RTC video publication failed");
       sources.push_back(std::move(source));
@@ -465,6 +479,11 @@ int vehicle_edge::RunMediaBackend(const MediaWorkerConfig &config) {
           input_frame.width = frame->width;
           input_frame.height = frame->height;
           input_frame.timestamp_us = base_time[cam] + elapsed_us;
+          if (frame->capture_time_us > 0) {
+            input_frame.metadata.emplace();
+            input_frame.metadata->user_timestamp_us =
+                static_cast<std::uint64_t>(frame->capture_time_us);
+          }
           input_frame.data = std::move(frame->data);
           if (!encoded_sources[cam]->captureFrame(input_frame)) {
             waiting_keyframe[cam] = true;
