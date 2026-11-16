@@ -39,11 +39,13 @@ namespace vehicle_edge {
 namespace {
 
 std::string OptionalStringField(const Json::Value &root, const char *key,
-                                const std::string &fallback = "") {
-  if (!root.isMember(key) || root[key].isNull())
+                                const std::string &fallback = "",
+                                bool nullable = false) {
+  if (!root.isMember(key) || (nullable && root[key].isNull()))
     return fallback;
-  if (!root[key].isString()) {
-    throw std::invalid_argument(std::string("non-string config field: ") + key);
+  if (!root[key].isString() || root[key].asString().empty()) {
+    throw std::invalid_argument(std::string("expected non-empty config string: ") +
+                                key);
   }
   return root[key].asString();
 }
@@ -75,7 +77,7 @@ std::string FetchMediaTokenFallback(const MediaWorkerConfig &config) {
 MediaWorkerConfig ParseMediaWorkerConfig(const Json::Value &root) {
   MediaWorkerConfig config;
   static_cast<AuthConfig &>(config) = ParseAuthConfig(root);
-  config.livekit_url = OptionalStringField(root, "livekit_url");
+  config.livekit_url = OptionalStringField(root, "livekit_url", "", true);
   if (root.isMember("media_enabled")) {
     if (!root["media_enabled"].isBool()) {
       throw std::invalid_argument("media_enabled must be a boolean");
@@ -83,7 +85,7 @@ MediaWorkerConfig ParseMediaWorkerConfig(const Json::Value &root) {
     config.media_enabled = root["media_enabled"].asBool();
   }
   config.camera_source =
-      OptionalStringField(root, "camera_source", "simulation");
+      OptionalStringField(root, "camera_source", "disabled", true);
   config.camera_layout = OptionalStringField(root, "camera_layout", "single");
   config.camera_track = OptionalStringField(root, "camera_track", "camera0");
   config.control_mode = OptionalStringField(root, "control_mode", "disabled");

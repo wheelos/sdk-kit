@@ -863,6 +863,33 @@ Result Bootstrap::Advance() {
   return Wait(interval);
 }
 
+Json::Value DefaultRuntimeConfiguration(const std::string& credentials_file) {
+  if (credentials_file.empty() ||
+      !std::filesystem::path(credentials_file).is_absolute())
+    throw std::runtime_error("credentials_file must be an absolute path");
+  Json::Value runtime(Json::objectValue);
+  runtime["credentials_file"] = credentials_file;
+  runtime["node_name"] = "remote_vehicle_telemetry";
+  runtime["upload_interval_ms"] = 1000;
+  runtime["chassis_channel"] = "/apollo/canbus/chassis";
+  runtime["vehicle_status_channel"] = "/apollo/guardian/vehicle_status";
+  runtime["localization_channel"] = "/apollo/localization/pose";
+  runtime["media_enabled"] = false;
+  runtime["camera_track"] = "camera0";
+  runtime["camera_layout"] = "single";
+  runtime["control_mode"] = "disabled";
+  runtime["control_channel"] = "/apollo/teleop/control";
+  runtime["task_mode"] = "disabled";
+  for (const auto* field : {
+           "system_status_channel", "livekit_url", "media_worker_path",
+           "camera_source", "camera_capture_config", "data_store_path",
+           "mission_runtime_channel", "mission_result_channel",
+           "mission_request_channel", "map_id", "vehicle_model",
+           "software_version"})
+    runtime[field] = Json::Value();
+  return runtime;
+}
+
 void Bootstrap::InstallConfiguration(const Json::Value& credentials) {
   const auto path = config_["device_config"].asString();
   const auto auth_path = config_["credentials_config"].asString();
@@ -870,12 +897,8 @@ void Bootstrap::InstallConfiguration(const Json::Value& credentials) {
       std::filesystem::absolute(auth_path).lexically_normal().string();
   auto existing = storage_.Read(path, true, 16384);
   Json::Value runtime = existing;
-  if (runtime.isNull()) {
+  if (runtime.isNull())
     runtime = Json::Value(Json::objectValue);
-    runtime["control_mode"] = "disabled";
-    runtime["media_enabled"] = false;
-    runtime["task_mode"] = "disabled";
-  }
   if (!existing.isNull()) {
     if (runtime["credentials_file"] != reference)
       throw std::runtime_error(
@@ -885,7 +908,10 @@ void Bootstrap::InstallConfiguration(const Json::Value& credentials) {
         throw std::runtime_error(
             "runtime must not contain inline authentication");
   }
-  runtime["credentials_file"] = reference;
+  const auto defaults = DefaultRuntimeConfiguration(reference);
+  for (const auto& name : defaults.getMemberNames()) {
+    if (!runtime.isMember(name)) runtime[name] = defaults[name];
+  }
   (void)ResolveDeviceConfig(runtime, credentials);
   if (JSON(runtime).size() + 1 > 16384)
     throw std::runtime_error("runtime device configuration exceeds 16 KiB");
@@ -901,7 +927,11 @@ void Bootstrap::InstallConfiguration(const Json::Value& credentials) {
   }
   if (runtime != existing) {
     storage_.Write(path, runtime);
-    hooks_.notice("Created safe runtime defaults; control remains disabled.");
+    hooks_.notice(existing.isNull()
+                      ? "Created complete runtime defaults; media, control and "
+                        "tasks remain disabled."
+                      : "Added missing runtime defaults; existing settings "
+                        "are unchanged.");
   }
   state_.removeMember("pending_credentials");
   state_.removeMember("rejected_credential_digest");

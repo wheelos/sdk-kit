@@ -56,6 +56,7 @@ const std::unordered_set<std::string> &KnownConfigFields() {
       "client_id",
       "client_secret",
       "chassis_channel",
+      "vehicle_status_channel",
       "localization_channel",
       "node_name",
       "upload_interval_ms",

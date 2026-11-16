@@ -577,12 +577,9 @@ void InstallLostResponsesAndRecovery() {
     Require(f.Tick(b).status == e::Status::Waiting,
             "lost ack reported success");
     auto device = f.storage.Read(f.directory + "/device.json");
-    Require(device["control_mode"] == "disabled" &&
-                device["media_enabled"] == false &&
-                device["task_mode"] == "disabled" &&
-                device["credentials_file"] == f.CredentialReference() &&
-                device.size() == 4,
-            "validated install did not create separated safe defaults");
+    Require(device == e::DefaultRuntimeConfiguration(f.CredentialReference()) &&
+                device.size() == 24,
+            "validated install did not create complete separated defaults");
     auto auth = f.storage.Read(f.directory + "/credentials.json");
     Require(auth == staged && !f.State().isMember("pending_credentials"),
             "validated credentials were not atomically promoted from staging");
@@ -1010,6 +1007,11 @@ void AutomaticDirectoriesAndSeparatedConfiguration() {
   Reject([&] { f.storage.EnsureDirectory(f.directory + "/linked/state"); });
 
   f.Existing();
+  auto original_runtime = f.storage.Read(f.directory + "/device.json");
+  original_runtime["chassis_channel"] = "/custom/chassis";
+  original_runtime["upload_interval_ms"] = 2500;
+  original_runtime["system_status_channel"] = Json::Value();
+  f.storage.Write(f.directory + "/device.json", original_runtime);
   f.server = [](const e::Request& request) -> e::Response {
     if (request.url.find("/oauth") != std::string::npos)
       return {200, "{\"access_token\":\"machine-token\",\"expires_in\":300}"};
@@ -1029,6 +1031,15 @@ void AutomaticDirectoriesAndSeparatedConfiguration() {
                 !runtime.isMember("client_secret") &&
                 credentials["client_secret"] == "protected-secret",
             "authentication lost runtime settings or mixed responsibilities");
+    for (const auto& name : original_runtime.getMemberNames())
+      Require(runtime[name] == original_runtime[name],
+              "default backfill changed an existing field");
+    Require(runtime.size() == 24 &&
+                runtime["vehicle_status_channel"] ==
+                    "/apollo/guardian/vehicle_status" &&
+                runtime["task_mode"] == "disabled" &&
+                runtime["data_store_path"].isNull(),
+            "existing runtime did not receive inactive missing defaults");
     Require(stat((f.directory + "/device.json").c_str(), &runtime_info) == 0,
             "cannot inspect runtime");
     {
@@ -1232,7 +1243,8 @@ void BootstrapDefaultsAndCrashAfterCredentials() {
   e::Bootstrap bootstrap(f.config, f.Hooks(), f.storage);
   Require(
       f.Tick(bootstrap).status == e::Status::Ready &&
-          f.storage.Read(f.directory + "/device.json").size() == 4,
+          f.storage.Read(f.directory + "/device.json") ==
+              e::DefaultRuntimeConfiguration(f.CredentialReference()),
       "crash after credentials was not repaired with safe defaults");
 }
 

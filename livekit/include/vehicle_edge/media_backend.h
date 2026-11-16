@@ -15,7 +15,7 @@ using SteadyTime = std::chrono::steady_clock::time_point;
 struct MediaWorkerConfig : AuthConfig {
   std::string livekit_url;
   bool media_enabled = false;
-  std::string camera_source = "simulation";
+  std::string camera_source = "disabled";
   std::string camera_layout = "single";
   std::string camera_track = "camera0";
   std::string control_mode = "disabled";

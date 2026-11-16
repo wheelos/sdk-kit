@@ -20,3 +20,12 @@ cc_test(
     deps = ["//livekit:encoded_video"],
 )
 
+cc_test(
+    name = "media_config_test",
+    srcs = ["media_config_test.cc"],
+    deps = [
+        "//auth:bootstrap",
+        "//livekit:worker_runtime",
+    ],
+)
+

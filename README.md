@@ -14,7 +14,7 @@ data/sdk-kit/
 │   ├── {encoded_video.cc,media_backend.cc,media_worker.cc}
 │   └── livekit_ffi/{livekit-data-sender.patch,livekit_sender.rs,LiveKitSDK.cmake,LiveKitFFIPatch.cmake}
 └── tests/          # Standalone SDK unit tests
-    └── {auth_diagnostics_test.cc,bootstrap_test.cc,encoded_video_test.cc}
+    └── {auth_diagnostics_test.cc,bootstrap_test.cc,encoded_video_test.cc,media_config_test.cc}
 ```
 
 ## Public Bazel Targets
@@ -67,14 +67,20 @@ Enrollment no longer reads a runtime template. Redeemed credentials are staged
 inside `enrollment.json`, validated for exact `token_url`/`issuer` origin plus
 OAuth and Gateway `device-auth-check`, and only then committed to
 `/etc/teleop/credentials.json` (without `allow_insecure_localhost` in
-production) and safe minimal runtime settings in `/etc/teleop/device.json`
-(`credentials_file` reference). If valid credentials are already on disk after a
+production) and complete runtime defaults in `/etc/teleop/device.json`
+(`credentials_file` reference). Optional, unconfigured runtime fields are
+explicit JSON `null`; media, control, tasks and durable storage remain disabled.
+`DefaultRuntimeConfiguration` defines the generated fields. Existing files gain
+only missing keys: explicit values, including `false` and optional `null`, are
+preserved. A repeated authentication with no missing fields does not rewrite
+the runtime file. If valid credentials are already on disk after a
 lost acknowledgment, `vehicle_bootstrap` verifies `device-auth-check` and
 completes `installation-complete` idempotently without re-redeeming. There is no
 old configuration migration or inline runtime-authentication fallback. Retired
 and unknown bootstrap fields are rejected, including `console_url` and the
 removed `allow_legacy_complete_404` flag. Installation acknowledgment must
-return `204`. Rotation changes credentials, not runtime settings.
+return `204`. Rotation preserves existing runtime settings while backfilling
+missing defaults.
 `LoadDeviceConfigJSON` resolves the reference for Apollo, authentication
 diagnostics and the media worker; `ResolveDeviceConfig` rejects mixed file
 responsibilities. `LoadAuthConfig` also accepts an authentication-only file for
@@ -85,6 +91,10 @@ root-owned dedicated-group `0640` under a protected `0750` directory; atomic
 root rotation preserves existing group and mode. Non-root manual enrollment
 uses `--config PATH` with explicit account-owned `0600` files and `0700` paths.
 Database-directory preparation belongs to the runtime account.
+Consumers must support nullable runtime fields before enrollment backfills the
+expanded configuration. Older minimal runtime files remain valid. The media
+worker treats an unset camera source as disabled and requires an explicit
+source when media is enabled; it never infers simulation from `null`.
 `SharedTokenProvider` reloads the protected credentials file once
 on OAuth `invalid_client` when vehicle/client/endpoint identities are unchanged.
 Credential changes also persist a maintenance notice until authentication and

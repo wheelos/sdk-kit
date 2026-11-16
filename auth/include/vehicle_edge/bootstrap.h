@@ -67,6 +67,8 @@ class Storage {
 Json::Value MergeCredentials(const Json::Value& existing,
                              const Json::Value& credentials, bool local_test);
 Json::Value ParseBootstrapConfig(Json::Value config);
+// Complete runtime defaults; null optional fields do not enable services.
+Json::Value DefaultRuntimeConfiguration(const std::string& credentials_file);
 bool InvalidCredentials(const Response& response);
 
 enum class Status { Waiting, Ready, Denied, Blocked };
