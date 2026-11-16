@@ -1038,8 +1038,9 @@ void AutomaticDirectoriesAndSeparatedConfiguration() {
                 runtime["vehicle_status_channel"] ==
                     "/apollo/guardian/vehicle_status" &&
                 runtime["task_mode"] == "disabled" &&
-                runtime["data_store_path"].isNull(),
-            "existing runtime did not receive inactive missing defaults");
+                runtime["data_store_path"] ==
+                    "/var/lib/teleop/data/data.sqlite3",
+            "existing runtime did not receive missing defaults");
     Require(stat((f.directory + "/device.json").c_str(), &runtime_info) == 0,
             "cannot inspect runtime");
     {
@@ -1072,6 +1073,113 @@ void AutomaticDirectoriesAndSeparatedConfiguration() {
   runtime.removeMember("client_secret");
   credentials["media_enabled"] = true;
   Reject([&] { vehicle_edge::ResolveDeviceConfig(runtime, credentials); });
+}
+
+void RuntimeDataDirectoryPreparation() {
+  Fixture f;
+  const auto defaults = e::DefaultRuntimeConfiguration(f.CredentialReference());
+  Require(defaults["data_store_path"] == "/var/lib/teleop/data/data.sqlite3" &&
+              e::MergeRuntimeDefaults(Json::Value(), f.CredentialReference()) ==
+                  defaults,
+          "new enrollment did not default to durable storage");
+  Json::Value minimal(Json::objectValue);
+  minimal["credentials_file"] = f.CredentialReference();
+  Require(e::MergeRuntimeDefaults(minimal, f.CredentialReference()) == defaults,
+          "missing data store was not backfilled");
+  const auto root = std::filesystem::absolute(f.directory);
+  const auto state = (root / "bootstrap").string();
+  const auto database = (root / "data/data.sqlite3").string();
+  const auto directory = root / "data";
+  auto runtime = minimal;
+  runtime["data_store_path"] = Json::Value();
+  runtime = e::MergeRuntimeDefaults(runtime, f.CredentialReference());
+  Require(runtime["data_store_path"].isNull() &&
+              !e::PrepareRuntimeDataDirectory(runtime, state, f.storage) &&
+              !std::filesystem::exists(directory),
+          "explicit null enabled storage");
+  runtime["data_store_path"] = database;
+  runtime = e::MergeRuntimeDefaults(runtime, f.CredentialReference());
+  Require(runtime["data_store_path"] == database &&
+              e::PrepareRuntimeDataDirectory(runtime, state, f.storage),
+          "custom data directory was not prepared");
+  struct stat before {};
+  Require(lstat(directory.c_str(), &before) == 0 &&
+              S_ISDIR(before.st_mode) && before.st_uid == geteuid() &&
+              (before.st_mode & 07777) == 0700 &&
+              !std::filesystem::exists(database) &&
+              !std::filesystem::exists(database + ".lock") &&
+              !std::filesystem::exists(state) &&
+              !std::filesystem::exists(f.directory + "/device.json") &&
+              !std::filesystem::exists(f.directory + "/credentials.json"),
+          "preparation changed more than the protected data directory");
+  Json::Value sentinel(Json::objectValue);
+  sentinel["existing_data"] = "preserve";
+  f.storage.Write(database, sentinel);
+  Require(e::PrepareRuntimeDataDirectory(runtime, state, f.storage) &&
+              f.storage.Read(database) == sentinel,
+          "repeated preparation changed existing data");
+  struct stat after {};
+  Require(lstat(directory.c_str(), &after) == 0 &&
+              before.st_ino == after.st_ino,
+          "repeated preparation replaced the directory");
+
+  for (mode_t mode : {0750, 0777}) {
+    Require(chmod(directory.c_str(), mode) == 0, "cannot set test permissions");
+    Reject([&] { e::PrepareRuntimeDataDirectory(runtime, state, f.storage); });
+    Require(lstat(directory.c_str(), &after) == 0 &&
+                (after.st_mode & 07777) == mode,
+            "preparation changed existing directory permissions");
+  }
+  Require(chmod(directory.c_str(), 0700) == 0, "cannot restore test permissions");
+  if (geteuid() == 0) {
+    Require(chown(directory.c_str(), 65534, 65534) == 0,
+            "cannot change test owner");
+    Reject([&] { e::PrepareRuntimeDataDirectory(runtime, state, f.storage); });
+    Require(lstat(directory.c_str(), &after) == 0 && after.st_uid == 65534,
+            "preparation changed existing owner");
+    Require(chown(directory.c_str(), geteuid(), getegid()) == 0,
+            "cannot restore test owner");
+  }
+  std::filesystem::create_directory_symlink("data", root / "linked");
+  for (const auto& path : {
+           (root / "linked/data.sqlite3").string(),
+           (root / "linked/new/data.sqlite3").string(),
+           (root / "data/../escape/data.sqlite3").string(),
+           state + "/data.sqlite3", state + "/nested/data.sqlite3",
+           std::string("/data.sqlite3"), directory.string() + "/",
+           std::string("relative/data.sqlite3")}) {
+    auto invalid = runtime;
+    invalid["data_store_path"] = path;
+    Reject([&] { e::PrepareRuntimeDataDirectory(invalid, state, f.storage); });
+  }
+  for (const auto& value : {Json::Value(""), Json::Value(7), Json::Value(false),
+                           Json::Value(Json::arrayValue)}) {
+    auto invalid = runtime;
+    invalid["data_store_path"] = value;
+    Reject([&] { e::PrepareRuntimeDataDirectory(invalid, state, f.storage); });
+  }
+  Require(!std::filesystem::exists(root / "escape") &&
+              !std::filesystem::exists(directory / "new") &&
+              !std::filesystem::exists(state),
+          "rejected path created directories");
+
+  // Successful reauthentication must preserve explicit null and custom paths.
+  f.Existing();
+  f.server = [](const e::Request& request) -> e::Response {
+    if (request.url.find("/oauth") != std::string::npos)
+      return {200, "{\"access_token\":\"machine-token\",\"expires_in\":300}"};
+    return {204, ""};
+  };
+  for (const auto& value : {Json::Value(), Json::Value(database)}) {
+    auto existing = f.storage.Read(f.directory + "/device.json");
+    existing["data_store_path"] = value;
+    f.storage.Write(f.directory + "/device.json", existing);
+    e::Bootstrap bootstrap(f.config, f.Hooks(), f.storage);
+    Require(f.Tick(bootstrap).status == e::Status::Ready &&
+                f.storage.Read(f.directory + "/device.json")["data_store_path"] ==
+                    value,
+            "authentication changed an explicit data store setting");
+  }
 }
 
 void GroupReadableRotation() {
@@ -1304,6 +1412,7 @@ int main() {
     LocalHTTPTransport();
     SafeStorageAndMerge();
     AutomaticDirectoriesAndSeparatedConfiguration();
+    RuntimeDataDirectoryPreparation();
     GroupReadableRotation();
     LegacyCrossOriginUpgrade();
     BootstrapDefaultsAndCrashAfterCredentials();

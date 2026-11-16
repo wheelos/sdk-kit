@@ -14,9 +14,11 @@
 
 #include "vehicle_edge/bootstrap.h"
 
+#include <sys/stat.h>
 #include <unistd.h>
 
 #include <algorithm>
+#include <cerrno>
 #include <chrono>
 #include <ctime>
 #include <filesystem>
@@ -880,9 +882,10 @@ Json::Value DefaultRuntimeConfiguration(const std::string& credentials_file) {
   runtime["control_mode"] = "disabled";
   runtime["control_channel"] = "/apollo/teleop/control";
   runtime["task_mode"] = "disabled";
+  runtime["data_store_path"] = "/var/lib/teleop/data/data.sqlite3";
   for (const auto* field : {
            "system_status_channel", "livekit_url", "media_worker_path",
-           "camera_source", "camera_capture_config", "data_store_path",
+           "camera_source", "camera_capture_config",
            "mission_runtime_channel", "mission_result_channel",
            "mission_request_channel", "map_id", "vehicle_model",
            "software_version"})
@@ -890,17 +893,16 @@ Json::Value DefaultRuntimeConfiguration(const std::string& credentials_file) {
   return runtime;
 }
 
-void Bootstrap::InstallConfiguration(const Json::Value& credentials) {
-  const auto path = config_["device_config"].asString();
-  const auto auth_path = config_["credentials_config"].asString();
-  const auto reference =
-      std::filesystem::absolute(auth_path).lexically_normal().string();
-  auto existing = storage_.Read(path, true, 16384);
+Json::Value MergeRuntimeDefaults(const Json::Value& existing,
+                                const std::string& credentials_file) {
+  const auto defaults = DefaultRuntimeConfiguration(credentials_file);
   Json::Value runtime = existing;
   if (runtime.isNull())
     runtime = Json::Value(Json::objectValue);
+  if (!runtime.isObject())
+    throw std::runtime_error("runtime config must be an object");
   if (!existing.isNull()) {
-    if (runtime["credentials_file"] != reference)
+    if (runtime["credentials_file"] != credentials_file)
       throw std::runtime_error(
           "runtime credentials file does not match bootstrap");
     for (const auto& name : runtime.getMemberNames())
@@ -908,10 +910,51 @@ void Bootstrap::InstallConfiguration(const Json::Value& credentials) {
         throw std::runtime_error(
             "runtime must not contain inline authentication");
   }
-  const auto defaults = DefaultRuntimeConfiguration(reference);
   for (const auto& name : defaults.getMemberNames()) {
     if (!runtime.isMember(name)) runtime[name] = defaults[name];
   }
+  return runtime;
+}
+
+bool PrepareRuntimeDataDirectory(const Json::Value& runtime,
+                                const std::string& state_directory,
+                                Storage storage) {
+  if (!runtime.isObject() || !runtime.isMember("data_store_path"))
+    throw std::runtime_error("data directory preparation requires runtime defaults");
+  if (runtime["data_store_path"].isNull()) return false;
+  const std::filesystem::path path(Text(runtime, "data_store_path", 4096));
+  if (!path.is_absolute() || path.filename().empty() ||
+      path.filename() == "." || path.filename() == "..")
+    throw std::runtime_error("data store requires an absolute database file path");
+  for (const auto& part : path)
+    if (part == "..")
+      throw std::runtime_error("data store parent traversal is forbidden");
+  const auto directory = path.parent_path().lexically_normal();
+  const auto state =
+      std::filesystem::absolute(state_directory).lexically_normal();
+  const auto relative = directory.lexically_relative(state);
+  if (directory == directory.root_path() ||
+      (!relative.empty() && *relative.begin() != ".."))
+    throw std::runtime_error("data store requires a directory outside bootstrap state");
+  struct stat info {};
+  if (lstat(directory.c_str(), &info) == 0) {
+    if (!S_ISDIR(info.st_mode) || info.st_uid != geteuid() ||
+        (info.st_mode & 07777) != 0700)
+      throw std::runtime_error("existing data directory must be owned mode 0700");
+  } else if (errno != ENOENT) {
+    throw std::runtime_error("cannot inspect data directory");
+  }
+  storage.EnsureDirectory(directory.string());
+  return true;
+}
+
+void Bootstrap::InstallConfiguration(const Json::Value& credentials) {
+  const auto path = config_["device_config"].asString();
+  const auto auth_path = config_["credentials_config"].asString();
+  const auto reference =
+      std::filesystem::absolute(auth_path).lexically_normal().string();
+  const auto existing = storage_.Read(path, true, 16384);
+  const auto runtime = MergeRuntimeDefaults(existing, reference);
   (void)ResolveDeviceConfig(runtime, credentials);
   if (JSON(runtime).size() + 1 > 16384)
     throw std::runtime_error("runtime device configuration exceeds 16 KiB");

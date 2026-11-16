@@ -44,20 +44,31 @@ bool SafeDiagnosticText(const std::string& text) {
 int main(int argc, char** argv) {
   const bool check = argc == 4 && std::string(argv[1]) == "--check-config" &&
                      std::string(argv[2]) == "--gateway-url";
+  const bool prepare_gateway =
+      argc == 4 && std::string(argv[1]) == "--prepare-data-directory" &&
+      std::string(argv[2]) == "--gateway-url";
+  const bool prepare_config =
+      argc == 4 && std::string(argv[1]) == "--prepare-data-directory" &&
+      std::string(argv[2]) == "--config";
+  const bool prepare = prepare_gateway || prepare_config;
   const bool configure = argc == 4 && std::string(argv[1]) == "--configure" &&
                          std::string(argv[2]) == "--gateway-url";
   const bool enroll = argc == 3 && std::string(argv[1]) == "--gateway-url";
   const bool run =
       argc == 1 || (argc == 3 && std::string(argv[1]) == "--config");
-  if (!check && !configure && !enroll && !run) {
+  if (!check && !prepare && !configure && !enroll && !run) {
     std::cerr
         << "Usage: vehicle_bootstrap [--config /etc/teleop/bootstrap.json]\n"
         << "       vehicle_bootstrap --configure|--check-config "
            "--gateway-url HTTPS_URL\n"
-        << "       vehicle_bootstrap --gateway-url HTTPS_URL\n";
+        << "       vehicle_bootstrap --gateway-url HTTPS_URL\n"
+        << "       vehicle_bootstrap --prepare-data-directory "
+           "--gateway-url HTTPS_URL\n"
+        << "       vehicle_bootstrap --prepare-data-directory "
+           "--config /path/to/bootstrap.json\n";
     return 78;
   }
-  if (geteuid() != 0 && !(run && argc == 3)) {
+  if (geteuid() != 0 && !(run && argc == 3) && !prepare_config) {
     std::cerr << "Non-root bootstrap requires --config with protected "
                  "current-user-owned paths.\n";
     return 78;
@@ -71,19 +82,38 @@ int main(int argc, char** argv) {
   signal(SIGINT, Cancel);
   try {
     vehicle_edge::enrollment::Storage storage;
-    const int gateway_arg = (check || configure) ? 3 : 2;
-    if ((check || configure || enroll) &&
+    const int gateway_arg = (check || prepare_gateway || configure) ? 3 : 2;
+    if ((check || prepare_gateway || configure || enroll) &&
         !vehicle_edge::AllowedURL(argv[gateway_arg], false))
       throw std::runtime_error("configuration endpoints require HTTPS");
-    if (check) {
+    if (check || prepare) {
       Json::Value config(Json::objectValue);
-      if (access("/etc/teleop", F_OK) == 0)
-        config = storage.Read("/etc/teleop/bootstrap.json", true, 16384);
-      else if (errno != ENOENT)
-        throw std::runtime_error("cannot inspect bootstrap configuration");
-      if (config.isNull()) config = Json::Value(Json::objectValue);
-      config["gateway_url"] = argv[gateway_arg];
-      (void)vehicle_edge::enrollment::ParseBootstrapConfig(config);
+      if (prepare_config) {
+        config = storage.Read(argv[3]);
+      } else {
+        if (access("/etc/teleop", F_OK) == 0)
+          config = storage.Read("/etc/teleop/bootstrap.json", true, 16384);
+        else if (errno != ENOENT)
+          throw std::runtime_error("cannot inspect bootstrap configuration");
+        if (config.isNull()) config = Json::Value(Json::objectValue);
+        config["gateway_url"] = argv[gateway_arg];
+      }
+      config = vehicle_edge::enrollment::ParseBootstrapConfig(config);
+      if (prepare) {
+        const auto device = config["device_config"].asString();
+        // The optional runtime file may not exist on first enrollment.
+        storage.EnsureDirectory(
+            std::filesystem::path(device).parent_path().string());
+        const auto reference = std::filesystem::absolute(
+            config["credentials_config"].asString()).lexically_normal().string();
+        const auto runtime = vehicle_edge::enrollment::MergeRuntimeDefaults(
+            storage.Read(device, true, 16384), reference);
+        const bool enabled = vehicle_edge::enrollment::PrepareRuntimeDataDirectory(
+            runtime, config["state_directory"].asString(), storage);
+        std::cout << (enabled
+            ? "Protected data directory prepared; no database or services started.\n"
+            : "Data storage is explicitly disabled; no data directory prepared.\n");
+      }
       return 0;
     }
     if (run && argc == 3) {

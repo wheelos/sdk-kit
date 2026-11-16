@@ -69,7 +69,9 @@ OAuth and Gateway `device-auth-check`, and only then committed to
 `/etc/teleop/credentials.json` (without `allow_insecure_localhost` in
 production) and complete runtime defaults in `/etc/teleop/device.json`
 (`credentials_file` reference). Optional, unconfigured runtime fields are
-explicit JSON `null`; media, control, tasks and durable storage remain disabled.
+explicit JSON `null`, except `data_store_path`, which defaults to
+`/var/lib/teleop/data/data.sqlite3`. Media, control and tasks remain disabled.
+Explicit `data_store_path: null` still disables durable storage.
 `DefaultRuntimeConfiguration` defines the generated fields. Existing files gain
 only missing keys: explicit values, including `false` and optional `null`, are
 preserved. A repeated authentication with no missing fields does not rewrite
@@ -90,9 +92,27 @@ credentials reference. Split production files support root-owned `0600`, or
 root-owned dedicated-group `0640` under a protected `0750` directory; atomic
 root rotation preserves existing group and mode. Non-root manual enrollment
 uses `--config PATH` with explicit account-owned `0600` files and `0700` paths.
-Database-directory preparation belongs to the runtime account.
+Database-directory preparation belongs to the runtime account. For the root
+runtime, the Apollo enrollment wrapper calls
+`vehicle_bootstrap --prepare-data-directory --gateway-url HTTPS_URL` before
+enrollment. This offline command reads the protected bootstrap/runtime files,
+uses the same missing-key defaults as installation, preserves custom paths and
+skips explicit null. It prepares the runtime configuration parent if absent and
+the private database parent (`0700`), but does not write configuration, create
+SQLite files, generate keys or start services. Existing data directories with
+incorrect owners/permissions, symlinks, parent traversal and paths inside the
+bootstrap state directory are rejected; existing permissions are never changed.
+When using bootstrap directly, prepare storage explicitly. A non-root runtime
+must use its own data directory and run
+`vehicle_bootstrap --prepare-data-directory --config PATH` as that account
+with its protected bootstrap config. The root wrapper must not be used to
+provision its database. SQLite files and tables
+are created by the Apollo runtime on startup, not by enrollment. Persist the
+data directory outside the container writable layer if containers are replaced.
 Consumers must support nullable runtime fields before enrollment backfills the
-expanded configuration. Older minimal runtime files remain valid. The media
+expanded configuration. Older minimal runtime files remain valid; loading a
+file without `data_store_path` still disables storage until enrollment backfills
+the missing field. Existing explicit null is preserved during backfill. The media
 worker treats an unset camera source as disabled and requires an explicit
 source when media is enabled; it never infers simulation from `null`.
 `SharedTokenProvider` reloads the protected credentials file once
