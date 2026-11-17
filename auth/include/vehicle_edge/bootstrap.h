@@ -69,6 +69,7 @@ Json::Value MergeCredentials(const Json::Value& existing,
 Json::Value ParseBootstrapConfig(Json::Value config);
 // Generated defaults enable durable storage; media, control and tasks stay off.
 Json::Value DefaultRuntimeConfiguration(const std::string& credentials_file);
+Json::Value DefaultCameraCaptureConfiguration();
 // Preserve explicit values, including null, and add only missing defaults.
 Json::Value MergeRuntimeDefaults(const Json::Value& existing,
                                 const std::string& credentials_file);
@@ -77,6 +78,10 @@ Json::Value MergeRuntimeDefaults(const Json::Value& existing,
 bool PrepareRuntimeDataDirectory(const Json::Value& runtime,
                                 const std::string& state_directory,
                                 Storage storage = Storage());
+// Create a protected camera config if missing; preserve existing files/null.
+// Returns true only when the default file was created. Never opens cameras.
+bool PrepareCameraCaptureConfiguration(const Json::Value& runtime,
+                                       Storage storage = Storage());
 bool InvalidCredentials(const Response& response);
 
 enum class Status { Waiting, Ready, Denied, Blocked };

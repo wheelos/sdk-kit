@@ -44,11 +44,15 @@ bool SafeDiagnosticText(const std::string& text) {
 int main(int argc, char** argv) {
   const bool check = argc == 4 && std::string(argv[1]) == "--check-config" &&
                      std::string(argv[2]) == "--gateway-url";
+  const bool prepare_data =
+      argc == 4 && std::string(argv[1]) == "--prepare-data-directory";
+  const bool prepare_camera =
+      argc == 4 && std::string(argv[1]) == "--prepare-camera-config";
   const bool prepare_gateway =
-      argc == 4 && std::string(argv[1]) == "--prepare-data-directory" &&
+      (prepare_data || prepare_camera) &&
       std::string(argv[2]) == "--gateway-url";
   const bool prepare_config =
-      argc == 4 && std::string(argv[1]) == "--prepare-data-directory" &&
+      (prepare_data || prepare_camera) &&
       std::string(argv[2]) == "--config";
   const bool prepare = prepare_gateway || prepare_config;
   const bool configure = argc == 4 && std::string(argv[1]) == "--configure" &&
@@ -65,6 +69,10 @@ int main(int argc, char** argv) {
         << "       vehicle_bootstrap --prepare-data-directory "
            "--gateway-url HTTPS_URL\n"
         << "       vehicle_bootstrap --prepare-data-directory "
+           "--config /path/to/bootstrap.json\n"
+        << "       vehicle_bootstrap --prepare-camera-config "
+           "--gateway-url HTTPS_URL\n"
+        << "       vehicle_bootstrap --prepare-camera-config "
            "--config /path/to/bootstrap.json\n";
     return 78;
   }
@@ -108,11 +116,22 @@ int main(int argc, char** argv) {
             config["credentials_config"].asString()).lexically_normal().string();
         const auto runtime = vehicle_edge::enrollment::MergeRuntimeDefaults(
             storage.Read(device, true, 16384), reference);
-        const bool enabled = vehicle_edge::enrollment::PrepareRuntimeDataDirectory(
-            runtime, config["state_directory"].asString(), storage);
-        std::cout << (enabled
-            ? "Protected data directory prepared; no database or services started.\n"
-            : "Data storage is explicitly disabled; no data directory prepared.\n");
+        if (prepare_camera) {
+          const bool created =
+              vehicle_edge::enrollment::PrepareCameraCaptureConfiguration(
+                  runtime, storage);
+          std::cout << (runtime["camera_capture_config"].isNull()
+              ? "Camera configuration is explicitly unset; no file created.\n"
+              : created
+                  ? "Created protected camera defaults; no cameras or services started.\n"
+                  : "Existing protected camera configuration preserved.\n");
+        } else {
+          const bool enabled = vehicle_edge::enrollment::PrepareRuntimeDataDirectory(
+              runtime, config["state_directory"].asString(), storage);
+          std::cout << (enabled
+              ? "Protected data directory prepared; no database or services started.\n"
+              : "Data storage is explicitly disabled; no data directory prepared.\n");
+        }
       }
       return 0;
     }

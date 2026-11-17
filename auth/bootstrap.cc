@@ -879,18 +879,52 @@ Json::Value DefaultRuntimeConfiguration(const std::string& credentials_file) {
   runtime["media_enabled"] = false;
   runtime["camera_track"] = "camera0";
   runtime["camera_layout"] = "single";
+  runtime["camera_capture_config"] = "/etc/teleop/cameras.json";
   runtime["control_mode"] = "disabled";
   runtime["control_channel"] = "/apollo/teleop/control";
   runtime["task_mode"] = "disabled";
   runtime["data_store_path"] = "/var/lib/teleop/data/data.sqlite3";
   for (const auto* field : {
            "system_status_channel", "livekit_url", "media_worker_path",
-           "camera_source", "camera_capture_config",
+           "camera_source",
            "mission_runtime_channel", "mission_result_channel",
            "mission_request_channel", "map_id", "vehicle_model",
            "software_version"})
     runtime[field] = Json::Value();
   return runtime;
+}
+
+Json::Value DefaultCameraCaptureConfiguration() {
+  Json::Value config(Json::objectValue);
+  config["devices"] = Json::Value(Json::arrayValue);
+  for (const auto* device : {"/dev/video0", "/dev/video1", "/dev/video2"})
+    config["devices"].append(device);
+  config["width"] = 1920;
+  config["height"] = 1080;
+  config["fps"] = 30;
+  config["output_width"] = 1280;
+  config["output_height"] = 720;
+  config["bitrate_bps"] = 2000000;
+  config["keyframe_interval"] = 30;
+  return config;
+}
+
+bool PrepareCameraCaptureConfiguration(const Json::Value& runtime,
+                                       Storage storage) {
+  if (!runtime.isObject() || !runtime.isMember("camera_capture_config"))
+    throw std::runtime_error("camera preparation requires runtime defaults");
+  if (runtime["camera_capture_config"].isNull()) return false;
+  const std::filesystem::path path(Text(runtime, "camera_capture_config", 4096));
+  if (!path.is_absolute() || path.filename().empty() ||
+      path.filename() == "." || path.filename() == "..")
+    throw std::runtime_error("camera configuration requires an absolute file path");
+  for (const auto& part : path)
+    if (part == "..")
+      throw std::runtime_error("camera configuration parent traversal is forbidden");
+  storage.EnsureDirectory(path.parent_path().string());
+  if (!storage.Read(path.string(), true, 16384).isNull()) return false;
+  storage.Write(path.string(), DefaultCameraCaptureConfiguration());
+  return true;
 }
 
 Json::Value MergeRuntimeDefaults(const Json::Value& existing,

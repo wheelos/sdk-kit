@@ -69,8 +69,9 @@ OAuth and Gateway `device-auth-check`, and only then committed to
 `/etc/teleop/credentials.json` (without `allow_insecure_localhost` in
 production) and complete runtime defaults in `/etc/teleop/device.json`
 (`credentials_file` reference). Optional, unconfigured runtime fields are
-explicit JSON `null`, except `data_store_path`, which defaults to
-`/var/lib/teleop/data/data.sqlite3`. Media, control and tasks remain disabled.
+explicit JSON `null`, except `data_store_path` and `camera_capture_config`,
+which default to `/var/lib/teleop/data/data.sqlite3` and
+`/etc/teleop/cameras.json`, respectively. Media, control and tasks remain disabled.
 Explicit `data_store_path: null` still disables durable storage.
 `DefaultRuntimeConfiguration` defines the generated fields. Existing files gain
 only missing keys: explicit values, including `false` and optional `null`, are
@@ -109,6 +110,19 @@ with its protected bootstrap config. The root wrapper must not be used to
 provision its database. SQLite files and tables
 are created by the Apollo runtime on startup, not by enrollment. Persist the
 data directory outside the container writable layer if containers are replaced.
+The wrapper also calls `vehicle_bootstrap --prepare-camera-config --gateway-url
+HTTPS_URL`. `DefaultCameraCaptureConfiguration` supplies three devices
+(`/dev/video0`, `/dev/video1`, `/dev/video2`), 1920x1080 at 30 fps, 1280x720
+output, 2000000 bps and keyframe interval 30. The command creates a missing
+protected camera JSON as `0600`, preserves existing files and custom paths, and
+skips explicit null. It performs no camera or network operations and changes
+no runtime switches. Non-root preparation accepts `--prepare-camera-config
+--config PATH` with a protected bootstrap config. Use the matching Apollo
+runtime: a prepared capture path is inactive with disabled media or simulation;
+physical capture requires enabled H264 media, the camera build option and a
+layout matching the file's device count. The generated runtime retains its
+existing `single` layout; select `three` to activate the three-device file.
+
 Consumers must support nullable runtime fields before enrollment backfills the
 expanded configuration. Older minimal runtime files remain valid; loading a
 file without `data_store_path` still disables storage until enrollment backfills

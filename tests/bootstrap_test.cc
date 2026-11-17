@@ -1182,6 +1182,78 @@ void RuntimeDataDirectoryPreparation() {
   }
 }
 
+void CameraConfigurationPreparation() {
+  Fixture f;
+  const auto expected = vehicle_edge::ParseHTTPJSON(R"({
+    "devices": ["/dev/video0", "/dev/video1", "/dev/video2"],
+    "width": 1920, "height": 1080, "fps": 30,
+    "output_width": 1280, "output_height": 720,
+    "bitrate_bps": 2000000, "keyframe_interval": 30
+  })");
+  Require(e::DefaultCameraCaptureConfiguration() == expected,
+          "camera defaults differ from the deployment profile");
+  auto runtime = e::DefaultRuntimeConfiguration(f.CredentialReference());
+  Require(runtime["camera_capture_config"] == "/etc/teleop/cameras.json" &&
+              !runtime["media_enabled"].asBool(),
+          "runtime defaults did not prepare inactive camera configuration");
+  runtime["camera_capture_config"] = Json::Value();
+  Require(e::MergeRuntimeDefaults(runtime, f.CredentialReference()) == runtime &&
+              !e::PrepareCameraCaptureConfiguration(runtime, f.storage),
+          "explicit null was changed or created a camera file");
+  runtime.removeMember("camera_capture_config");
+  Require(e::MergeRuntimeDefaults(runtime, f.CredentialReference())
+                  ["camera_capture_config"] == "/etc/teleop/cameras.json",
+          "missing camera path did not receive default");
+  const auto root = std::filesystem::absolute(f.directory);
+  const auto path = root / "capture/cameras.json";
+  runtime["camera_capture_config"] = path.string();
+  const auto original_runtime = runtime;
+  Require(e::PrepareCameraCaptureConfiguration(runtime, f.storage) &&
+              f.storage.Read(path.string()) == expected &&
+              runtime == original_runtime,
+          "camera preparation changed runtime or used wrong defaults");
+  struct stat info {};
+  Require(lstat(path.c_str(), &info) == 0 && S_ISREG(info.st_mode) &&
+              (info.st_mode & 07777) == 0600 && info.st_uid == geteuid(),
+          "camera defaults were not protected");
+  Require(lstat(path.parent_path().c_str(), &info) == 0 &&
+              (info.st_mode & 07777) == 0700,
+          "camera parent was not protected");
+  auto customized = expected;
+  customized["devices"][0] = "/dev/video7";
+  customized["fps"] = 15;
+  f.storage.Write(path.string(), customized);
+  Require(lstat(path.c_str(), &info) == 0, "cannot inspect camera file");
+  const auto inode = info.st_ino;
+  Require(!e::PrepareCameraCaptureConfiguration(runtime, f.storage) &&
+              f.storage.Read(path.string()) == customized &&
+              lstat(path.c_str(), &info) == 0 && info.st_ino == inode,
+          "camera preparation overwrote an existing custom file");
+  Require(chmod(path.c_str(), 0644) == 0, "cannot set camera test permissions");
+  Reject([&] { e::PrepareCameraCaptureConfiguration(runtime, f.storage); });
+  Require(lstat(path.c_str(), &info) == 0 && (info.st_mode & 07777) == 0644,
+          "camera preparation changed existing permissions");
+  Require(chmod(path.c_str(), 0600) == 0, "cannot restore camera test permissions");
+  std::filesystem::create_symlink("cameras.json", path.parent_path() / "linked.json");
+  std::filesystem::create_directory_symlink("capture", root / "linked");
+  for (const auto& bad : {
+           std::string("relative.json"), path.parent_path().string() + "/",
+           (root / "capture/../escape/cameras.json").string(),
+           (path.parent_path() / "linked.json").string(),
+           (root / "linked/new/cameras.json").string()}) {
+    runtime["camera_capture_config"] = bad;
+    Reject([&] { e::PrepareCameraCaptureConfiguration(runtime, f.storage); });
+  }
+  Require(!std::filesystem::exists(root / "escape") &&
+              !std::filesystem::exists(path.parent_path() / "new") &&
+              !std::filesystem::exists(root / "device.json") &&
+              !std::filesystem::exists(root / "credentials.json") &&
+              !std::filesystem::exists(root / "key.json"),
+          "camera preparation wrote unrelated configuration");
+  Require(f.storage.Read(path.string()) == customized,
+          "rejected camera preparation changed existing data");
+}
+
 void GroupReadableRotation() {
   if (geteuid() != 0) return;
   Fixture f;
@@ -1413,6 +1485,7 @@ int main() {
     SafeStorageAndMerge();
     AutomaticDirectoriesAndSeparatedConfiguration();
     RuntimeDataDirectoryPreparation();
+    CameraConfigurationPreparation();
     GroupReadableRotation();
     LegacyCrossOriginUpgrade();
     BootstrapDefaultsAndCrashAfterCredentials();
