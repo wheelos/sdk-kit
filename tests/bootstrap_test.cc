@@ -15,6 +15,9 @@
 #include "vehicle_edge/bootstrap.h"
 
 #include <arpa/inet.h>
+#include <fcntl.h>
+#include <grp.h>
+#include <pwd.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/timex.h>
@@ -32,6 +35,7 @@
 #include <openssl/evp.h>
 #include <openssl/sha.h>
 
+#include "vehicle_edge/auth_config.h"
 #include "vehicle_edge/http_client.h"
 
 namespace e = vehicle_edge::enrollment;
@@ -1306,6 +1310,132 @@ void GroupReadableRotation() {
   Require(chmod(".", 0700) == 0, "cannot restore isolated test permissions");
 }
 
+void RuntimeUserConfiguration() {
+  Json::Value config(Json::objectValue);
+  config["gateway_url"] = "https://gateway.example.com";
+  Require(!e::ParseBootstrapConfig(config).isMember("runtime_user"),
+          "legacy explicit configuration gained an implicit runtime account");
+  for (const auto* name : {"", "root", "--root", "../nvidia",
+                           "teleop-nonexistent-"}) {
+    config["runtime_user"] = name;
+    Reject([&] { e::ParseBootstrapConfig(config); });
+  }
+  config["runtime_user"] = false;
+  Reject([&] { e::ParseBootstrapConfig(config); });
+  // No machine-specific nvidia/dht dependency in the SDK tests.
+  if (const auto* account = getpwnam("nobody")) {
+    const std::string name = account->pw_name;
+    const auto uid = account->pw_uid;
+    const auto gid = account->pw_gid;
+    const auto user = e::ResolveRuntimeUser(name);
+    config["runtime_user"] = name;
+    Require(user.uid == uid && user.gid == gid &&
+                e::ParseBootstrapConfig(config)["runtime_user"] == name,
+            "runtime account did not retain its primary identity");
+  }
+}
+
+void RuntimeManagedStorage() {
+  if (geteuid() != 0) return;
+  Fixture f;
+  const e::RuntimeUser user{"isolated-test-runtime", 1000, 1000};
+  Require(chown(".", 0, user.gid) == 0 && chmod(".", 0750) == 0,
+          "cannot share isolated test suite parent");
+  f.storage.EnsureRuntimeDirectory(f.directory, user);
+  const auto config_dir = f.directory + "/config";
+  const auto state_dir = f.directory + "/bootstrap";
+  const auto data_dir = f.directory + "/data";
+  f.storage.EnsureRuntimeDirectory(config_dir, user);
+  f.storage.EnsureDirectory(state_dir);
+  f.storage.EnsureDataDirectory(data_dir, user);
+  const auto path = config_dir + "/device.json";
+  Json::Value value(Json::objectValue);
+  value["keep"] = "custom setting";
+  f.storage.WriteRuntime(path, value, user);
+  f.storage.Write(state_dir + "/key.json", value);
+  const int lock = f.storage.Lock(state_dir);
+  close(lock);
+  const auto check = [](const std::string& path, uid_t uid, gid_t gid,
+                        mode_t mode) {
+    struct stat info {};
+    Require(lstat(path.c_str(), &info) == 0 && info.st_uid == uid &&
+                info.st_gid == gid && (info.st_mode & 07777) == mode,
+            "managed runtime path has incorrect ownership or mode");
+  };
+  check(config_dir, 0, user.gid, 0750);
+  check(path, 0, user.gid, 0640);
+  check(state_dir, 0, 0, 0700);
+  check(state_dir + "/key.json", 0, 0, 0600);
+  check(state_dir + "/lock", 0, 0, 0600);
+  check(data_dir, user.uid, user.gid, 0700);
+  // Repeating preparation and atomic replacement must retain the same policy.
+  f.storage.EnsureDataDirectory(data_dir, user);
+  f.storage.EnsureRuntimeDirectory(config_dir, user);
+  value["keep"] = "updated setting";
+  f.storage.WriteRuntime(path, value, user);
+  check(path, 0, user.gid, 0640);
+  const auto existing = config_dir + "/credentials.json";
+  f.storage.Write(existing, value);
+  f.storage.ShareRuntimeFile(existing, user);
+  check(existing, 0, user.gid, 0640);
+  Require(f.storage.Read(existing) == value,
+          "sharing existing credentials changed their contents");
+  const auto old_data = f.directory + "/old-root-data";
+  f.storage.EnsureDirectory(old_data);
+  Reject([&] { f.storage.EnsureDataDirectory(old_data, user); });
+  check(old_data, 0, 0, 0700);
+  const auto alias = config_dir + "/alias.json";
+  std::filesystem::create_symlink("device.json", alias);
+  Reject([&] { f.storage.ShareRuntimeFile(alias, user); });
+  const auto child = fork();
+  Require(child >= 0, "cannot fork isolated runtime access check");
+  if (child == 0) {
+    if (setgroups(0, nullptr) || setgid(user.gid) || setuid(user.uid)) _exit(1);
+    try {
+      Require(vehicle_edge::LoadProtectedJSON(path) == value,
+              "runtime cannot read its root-owned configuration");
+      Require(access(path.c_str(), W_OK) != 0 &&
+                  access(config_dir.c_str(), W_OK) != 0 &&
+                  access((state_dir + "/key.json").c_str(), R_OK) != 0,
+              "runtime can modify configuration or read registration secrets");
+      const auto database = data_dir + "/data.sqlite3";
+      const int fd = open(database.c_str(), O_CREAT | O_EXCL | O_RDWR, 0600);
+      Require(fd >= 0, "runtime cannot create its own data file");
+      close(fd);
+      _exit(0);
+    } catch (...) { _exit(1); }
+  }
+  int status = 0;
+  Require(waitpid(child, &status, 0) == child && WIFEXITED(status) &&
+              WEXITSTATUS(status) == 0,
+          "runtime access boundary failed");
+  check(data_dir + "/data.sqlite3", user.uid, user.gid, 0600);
+  Require(chmod(".", 0700) == 0,
+          "cannot restore isolated suite permissions");
+}
+
+void ManagedRuntimePathSeparation() {
+  Json::Value config(Json::objectValue);
+  config["gateway_url"] = "https://gateway.example.com";
+  config = e::ParseBootstrapConfig(config);
+  auto runtime = e::DefaultRuntimeConfiguration(
+      config["credentials_config"].asString());
+  const auto valid = runtime;
+  e::ValidateRuntimeLayout(config, runtime, "/etc/teleop/bootstrap.json");
+  runtime["camera_capture_config"] = "/var/lib/teleop/bootstrap/key.json";
+  Reject([&] { e::ValidateRuntimeLayout(config, runtime, "/etc/teleop/bootstrap.json"); });
+  runtime = valid;
+  runtime["camera_capture_config"] = "/etc/teleop/credentials.json";
+  Reject([&] { e::ValidateRuntimeLayout(config, runtime, "/etc/teleop/bootstrap.json"); });
+  for (const auto* database : {"/etc/teleop/data.sqlite3",
+                              "/var/lib/teleop/data.sqlite3",
+                              "/var/lib/teleop/bootstrap/data.sqlite3"}) {
+    runtime = valid;
+    runtime["data_store_path"] = database;
+    Reject([&] { e::ValidateRuntimeLayout(config, runtime, "/etc/teleop/bootstrap.json"); });
+  }
+}
+
 void LegacyCrossOriginUpgrade() {
   Fixture f;
   f.config.removeMember("allow_insecure_localhost");
@@ -1487,6 +1617,9 @@ int main() {
     RuntimeDataDirectoryPreparation();
     CameraConfigurationPreparation();
     GroupReadableRotation();
+    RuntimeUserConfiguration();
+    RuntimeManagedStorage();
+    ManagedRuntimePathSeparation();
     LegacyCrossOriginUpgrade();
     BootstrapDefaultsAndCrashAfterCredentials();
     RejectMixedAndFlatConfiguration();

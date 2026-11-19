@@ -20,6 +20,7 @@
 #include <cstdint>
 #include <exception>
 #include <functional>
+#include <optional>
 #include <string>
 
 #include <json/json.h>
@@ -50,17 +51,36 @@ std::string Canonical(const std::string& action, const Json::Value& envelope);
 Json::Value Sign(const std::string& action, Json::Value envelope,
                  const std::string& private_key);
 
+struct RuntimeUser {
+  std::string name;
+  uid_t uid;
+  gid_t gid;
+};
+// Resolve an existing non-root account and its non-root primary group.
+RuntimeUser ResolveRuntimeUser(const std::string& name);
+
 class Storage {
  public:
   explicit Storage(uid_t owner = geteuid()) : owner_(owner) {}
   Json::Value Read(const std::string& path, bool optional = false,
                    std::size_t limit = 65536) const;
   void Write(const std::string& path, const Json::Value& value) const;
+  void WriteRuntime(const std::string& path, const Json::Value& value,
+                    const RuntimeUser& user) const;
+  // Root owns runtime configuration; the runtime primary group can only read.
+  void EnsureRuntimeDirectory(const std::string& path,
+                              const RuntimeUser& user) const;
+  void ShareRuntimeFile(const std::string& path, const RuntimeUser& user) const;
+  // Existing data directories are validated, never recursively reassigned.
+  void EnsureDataDirectory(const std::string& path,
+                           const RuntimeUser& user) const;
   void EnsureDirectory(const std::string& path) const;
   void Remove(const std::string& path) const;
   int Lock(const std::string& directory) const;
 
  private:
+  void WriteFile(const std::string& path, const Json::Value& value,
+                 const RuntimeUser* user) const;
   uid_t owner_;
 };
 
@@ -77,11 +97,17 @@ Json::Value MergeRuntimeDefaults(const Json::Value& existing,
 // Returns false when data_store_path is explicitly null.
 bool PrepareRuntimeDataDirectory(const Json::Value& runtime,
                                 const std::string& state_directory,
-                                Storage storage = Storage());
+                                Storage storage = Storage(),
+                                const RuntimeUser* user = nullptr);
 // Create a protected camera config if missing; preserve existing files/null.
 // Returns true only when the default file was created. Never opens cameras.
 bool PrepareCameraCaptureConfiguration(const Json::Value& runtime,
-                                       Storage storage = Storage());
+                                       Storage storage = Storage(),
+                                       const RuntimeUser* user = nullptr);
+// Validate separation before provisioning any runtime-readable or writable path.
+void ValidateRuntimeLayout(const Json::Value& config,
+                           const Json::Value& runtime,
+                           const std::string& bootstrap_config);
 bool InvalidCredentials(const Response& response);
 
 enum class Status { Waiting, Ready, Denied, Blocked };
@@ -127,6 +153,7 @@ class Bootstrap {
   Json::Value config_, state_;
   Hooks hooks_;
   Storage storage_;
+  std::optional<RuntimeUser> runtime_user_;
   std::string private_key_;
   std::string current_stage_;
   std::string last_diagnostic_key_;

@@ -15,16 +15,20 @@
 #include <signal.h>
 #include <sys/prctl.h>
 #include <sys/resource.h>
+#include <sys/stat.h>
 #include <unistd.h>
 
 #include <algorithm>
 #include <cerrno>
 #include <chrono>
+#include <cstdlib>
 #include <exception>
 #include <filesystem>
 #include <iostream>
+#include <stdexcept>
 #include <string>
 #include <thread>
+#include <vector>
 
 #include "vehicle_edge/auth_config.h"
 #include "vehicle_edge/bootstrap.h"
@@ -39,9 +43,48 @@ bool SafeDiagnosticText(const std::string& text) {
     return c >= 32 && c < 127 && c != '"' && c != '\\';
   });
 }
+Json::Value ReadOptional(const vehicle_edge::enrollment::Storage& storage,
+                         const std::string& path) {
+  auto parent = std::filesystem::path(path).parent_path();
+  if (parent.empty()) parent = ".";
+  if (access(parent.c_str(), F_OK) != 0) {
+    if (errno == ENOENT) return Json::Value();
+    throw std::runtime_error("cannot inspect bootstrap configuration parent");
+  }
+  return storage.Read(path, true, 16384);
+}
+void CheckPrivatePath(const std::string& path, bool directory = false) {
+  struct stat info {};
+  if (lstat(path.c_str(), &info)) {
+    if (errno == ENOENT) return;
+    throw std::runtime_error("cannot inspect private bootstrap path");
+  }
+  if (info.st_uid != 0 || info.st_gid != 0 ||
+      (directory ? !S_ISDIR(info.st_mode) : !S_ISREG(info.st_mode)) ||
+      (info.st_mode & 07777) != (directory ? 0700 : 0600) ||
+      (!directory && info.st_nlink != 1))
+    throw std::runtime_error("bootstrap secrets require private root ownership");
+}
 }  // namespace
 
 int main(int argc, char** argv) {
+  // Keep the original command forms while accepting this option in any position.
+  std::string requested_runtime_user;
+  std::vector<char*> arguments{argv[0]};
+  for (int i = 1; i < argc; ++i) {
+    if (std::string(argv[i]) == "--runtime-user") {
+      if (!requested_runtime_user.empty() || i + 1 == argc ||
+          argv[i + 1][0] == '\0' || argv[i + 1][0] == '-') {
+        std::cerr << "Specify one non-empty runtime user.\n";
+        return 78;
+      }
+      requested_runtime_user = argv[++i];
+    } else {
+      arguments.push_back(argv[i]);
+    }
+  }
+  argc = static_cast<int>(arguments.size());
+  argv = arguments.data();
   const bool check = argc == 4 && std::string(argv[1]) == "--check-config" &&
                      std::string(argv[2]) == "--gateway-url";
   const bool prepare_data =
@@ -73,7 +116,9 @@ int main(int argc, char** argv) {
         << "       vehicle_bootstrap --prepare-camera-config "
            "--gateway-url HTTPS_URL\n"
         << "       vehicle_bootstrap --prepare-camera-config "
-           "--config /path/to/bootstrap.json\n";
+           "--config /path/to/bootstrap.json\n"
+        << "Root-managed enrollment accepts --runtime-user USER; it is saved "
+           "in bootstrap.json, not device.json.\n";
     return 78;
   }
   if (geteuid() != 0 && !(run && argc == 3) && !prepare_config) {
@@ -90,77 +135,113 @@ int main(int argc, char** argv) {
   signal(SIGINT, Cancel);
   try {
     vehicle_edge::enrollment::Storage storage;
+    namespace enrollment = vehicle_edge::enrollment;
     const int gateway_arg = (check || prepare_gateway || configure) ? 3 : 2;
-    if ((check || prepare_gateway || configure || enroll) &&
+    const bool gateway_command = check || prepare_gateway || configure || enroll;
+    if (gateway_command &&
         !vehicle_edge::AllowedURL(argv[gateway_arg], false))
       throw std::runtime_error("configuration endpoints require HTTPS");
-    if (check || prepare) {
-      Json::Value config(Json::objectValue);
-      if (prepare_config) {
-        config = storage.Read(argv[3]);
+    const std::string bootstrap_path = prepare_config ? argv[3]
+        : run && argc == 3 ? argv[2] : "/etc/teleop/bootstrap.json";
+    auto saved = ReadOptional(storage, bootstrap_path);
+    if (saved.isNull()) saved = Json::Value(Json::objectValue);
+    auto config = saved;
+    if (gateway_command) config["gateway_url"] = argv[gateway_arg];
+    if (!requested_runtime_user.empty()) {
+      if (config.isMember("runtime_user") &&
+          config["runtime_user"] != requested_runtime_user)
+        throw std::runtime_error("runtime user change requires explicit offline migration");
+      config["runtime_user"] = requested_runtime_user;
+    } else if (!config.isMember("runtime_user") && geteuid() == 0 &&
+               gateway_command) {
+      const char* sudo_user = std::getenv("SUDO_USER");
+      if (sudo_user && *sudo_user && std::string(sudo_user) != "root")
+        config["runtime_user"] = sudo_user;
+    }
+    if (gateway_command && !config.isMember("runtime_user"))
+      throw std::runtime_error("specify runtime user when no saved user or sudo caller exists");
+    config = enrollment::ParseBootstrapConfig(config);
+    std::optional<enrollment::RuntimeUser> runtime_user;
+    if (config.isMember("runtime_user")) {
+      if (geteuid() != 0)
+        throw std::runtime_error("managed runtime enrollment requires root");
+      runtime_user = enrollment::ResolveRuntimeUser(config["runtime_user"].asString());
+      CheckPrivatePath(bootstrap_path);
+      const auto state = config["state_directory"].asString();
+      CheckPrivatePath(state, true);
+      for (const auto* file : {"key.json", "enrollment.json", "lock"})
+        CheckPrivatePath(state + "/" + file);
+    }
+    const auto device = config["device_config"].asString();
+    const auto credentials = config["credentials_config"].asString();
+    const auto runtime = enrollment::MergeRuntimeDefaults(
+        ReadOptional(storage, device),
+        std::filesystem::absolute(credentials).lexically_normal().string());
+    if (runtime_user)
+      enrollment::ValidateRuntimeLayout(config, runtime, bootstrap_path);
+    if (check) {
+      std::cout << "Runtime account validated: " << runtime_user->name
+                << " uid=" << runtime_user->uid << " gid=" << runtime_user->gid
+                << "; registration remains root-owned.\n";
+      return 0;
+    }
+    const auto runtime_parent = [&](const std::string& file) {
+      const auto parent = std::filesystem::path(file).parent_path().string();
+      if (runtime_user) storage.EnsureRuntimeDirectory(parent, *runtime_user);
+      else storage.EnsureDirectory(parent);
+    };
+    runtime_parent(device);
+    runtime_parent(credentials);
+    if (runtime_user) runtime_parent(config["state_directory"].asString());
+    if (prepare) {
+      if (prepare_camera) {
+        const bool created = enrollment::PrepareCameraCaptureConfiguration(
+            runtime, storage, runtime_user ? &*runtime_user : nullptr);
+        std::cout << (runtime["camera_capture_config"].isNull()
+            ? "Camera configuration is explicitly unset; no file created.\n"
+            : created
+                ? "Created protected camera defaults; no cameras or services started.\n"
+                : "Existing protected camera configuration preserved.\n");
       } else {
-        if (access("/etc/teleop", F_OK) == 0)
-          config = storage.Read("/etc/teleop/bootstrap.json", true, 16384);
-        else if (errno != ENOENT)
-          throw std::runtime_error("cannot inspect bootstrap configuration");
-        if (config.isNull()) config = Json::Value(Json::objectValue);
-        config["gateway_url"] = argv[gateway_arg];
-      }
-      config = vehicle_edge::enrollment::ParseBootstrapConfig(config);
-      if (prepare) {
-        const auto device = config["device_config"].asString();
-        // The optional runtime file may not exist on first enrollment.
-        storage.EnsureDirectory(
-            std::filesystem::path(device).parent_path().string());
-        const auto reference = std::filesystem::absolute(
-            config["credentials_config"].asString()).lexically_normal().string();
-        const auto runtime = vehicle_edge::enrollment::MergeRuntimeDefaults(
-            storage.Read(device, true, 16384), reference);
-        if (prepare_camera) {
-          const bool created =
-              vehicle_edge::enrollment::PrepareCameraCaptureConfiguration(
-                  runtime, storage);
-          std::cout << (runtime["camera_capture_config"].isNull()
-              ? "Camera configuration is explicitly unset; no file created.\n"
-              : created
-                  ? "Created protected camera defaults; no cameras or services started.\n"
-                  : "Existing protected camera configuration preserved.\n");
-        } else {
-          const bool enabled = vehicle_edge::enrollment::PrepareRuntimeDataDirectory(
-              runtime, config["state_directory"].asString(), storage);
-          std::cout << (enabled
-              ? "Protected data directory prepared; no database or services started.\n"
-              : "Data storage is explicitly disabled; no data directory prepared.\n");
-        }
+        const bool enabled = enrollment::PrepareRuntimeDataDirectory(
+            runtime, config["state_directory"].asString(), storage,
+            runtime_user ? &*runtime_user : nullptr);
+        std::cout << (enabled
+            ? "Runtime data directory prepared; no database or services started.\n"
+            : "Data storage is explicitly disabled; no data directory prepared.\n");
       }
       return 0;
     }
-    if (run && argc == 3) {
-      const auto config = vehicle_edge::enrollment::ParseBootstrapConfig(
-          storage.Read(argv[2]));
-      storage.EnsureDirectory(config["state_directory"].asString());
-      storage.EnsureDirectory(std::filesystem::path(
-          config["device_config"].asString()).parent_path().string());
-      storage.EnsureDirectory(std::filesystem::path(
-          config["credentials_config"].asString()).parent_path().string());
-    } else {
-    storage.EnsureDirectory("/etc/teleop");
-    storage.EnsureDirectory("/var/lib/teleop/bootstrap");
+    if (runtime_user && !configure) {
+      enrollment::PrepareRuntimeDataDirectory(runtime,
+          config["state_directory"].asString(), storage, &*runtime_user);
+      enrollment::PrepareCameraCaptureConfiguration(runtime, storage, &*runtime_user);
+      storage.ShareRuntimeFile(device, *runtime_user);
+      storage.ShareRuntimeFile(credentials, *runtime_user);
     }
-    if (configure || enroll) {
-      const int lock = storage.Lock("/var/lib/teleop/bootstrap");
+    storage.EnsureDirectory(config["state_directory"].asString());
+    const auto bootstrap_parent = std::filesystem::path(bootstrap_path).parent_path();
+    storage.EnsureDirectory(bootstrap_parent.string());
+    if (configure || enroll ||
+        (runtime_user && saved.get("runtime_user", Json::Value()) !=
+                             config["runtime_user"])) {
+      const int lock = storage.Lock(config["state_directory"].asString());
       try {
-        auto config = storage.Read("/etc/teleop/bootstrap.json", true, 16384);
-        if (config.isNull()) config = Json::Value(Json::objectValue);
-        config["gateway_url"] = argv[gateway_arg];
-        (void)vehicle_edge::enrollment::ParseBootstrapConfig(config);
-        storage.Write("/etc/teleop/bootstrap.json", config);
+        // Refuse to overwrite configuration changed since validation.
+        auto current = storage.Read(bootstrap_path, true, 16384);
+        if (current.isNull()) current = Json::Value(Json::objectValue);
+        if (current != saved)
+          throw std::runtime_error("bootstrap configuration changed; retry enrollment");
+        auto updated = saved;
+        updated["gateway_url"] = config["gateway_url"];
+        if (runtime_user) updated["runtime_user"] = runtime_user->name;
+        if (updated != saved) storage.Write(bootstrap_path, updated);
       } catch (...) {
         close(lock);
         throw;
       }
       close(lock);
-      std::cout << "Bootstrap address saved; existing keys and runtime "
+      std::cout << "Bootstrap address and runtime user saved; existing keys and runtime "
                    "settings are unchanged.\n";
       if (configure) return 0;
     }
@@ -169,8 +250,7 @@ int main(int argc, char** argv) {
       std::cout << message << std::endl;
     };
     vehicle_edge::enrollment::Bootstrap bootstrap(
-        storage.Read(run && argc == 3 ? argv[2] : "/etc/teleop/bootstrap.json"),
-        hooks, storage);
+        config, hooks, storage);
     while (!cancelled) {
       auto result = bootstrap.Step();
       using vehicle_edge::enrollment::Status;

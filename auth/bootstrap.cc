@@ -14,6 +14,8 @@
 
 #include "vehicle_edge/bootstrap.h"
 
+#include <grp.h>
+#include <pwd.h>
 #include <sys/stat.h>
 #include <unistd.h>
 
@@ -24,6 +26,7 @@
 #include <filesystem>
 #include <stdexcept>
 #include <utility>
+#include <vector>
 
 #include <openssl/rand.h>
 #include <openssl/sha.h>
@@ -230,14 +233,47 @@ Json::Value MergeCredentials(const Json::Value& existing,
   return merged;
 }
 
+RuntimeUser ResolveRuntimeUser(const std::string& name) {
+  if (name.empty() || name.size() > 256 || name.front() == '-' ||
+      std::any_of(name.begin(), name.end(), [](unsigned char c) {
+        return !((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+                 (c >= '0' && c <= '9') || c == '_' || c == '-' ||
+                 c == '.' || c == '$');
+      }))
+    throw std::runtime_error("invalid runtime user name");
+  std::vector<char> buffer(16384);
+  struct passwd account {}, *found = nullptr;
+  int error = 0;
+  while ((error = getpwnam_r(name.c_str(), &account, buffer.data(),
+                           buffer.size(), &found)) == ERANGE &&
+         buffer.size() < 1024 * 1024)
+    buffer.resize(buffer.size() * 2);
+  if (error || !found)
+    throw std::runtime_error("runtime user does not exist or cannot be resolved");
+  RuntimeUser user{name, account.pw_uid, account.pw_gid};
+  if (user.uid == 0 || user.gid == 0)
+    throw std::runtime_error("runtime user and primary group must be non-root");
+  struct group group {}, *group_found = nullptr;
+  while ((error = getgrgid_r(user.gid, &group, buffer.data(), buffer.size(),
+                           &group_found)) == ERANGE &&
+         buffer.size() < 1024 * 1024)
+    buffer.resize(buffer.size() * 2);
+  if (error || !group_found)
+    throw std::runtime_error("runtime primary group cannot be resolved");
+  return user;
+}
+
 Json::Value ParseBootstrapConfig(Json::Value config) {
   if (!config.isObject())
     throw std::runtime_error("bootstrap config must be an object");
   for (const auto& name : config.getMemberNames()) {
     if (name != "gateway_url" && name != "state_directory" && name != "device_config" &&
-        name != "credentials_config" && name != "allow_insecure_localhost")
+        name != "credentials_config" && name != "allow_insecure_localhost" &&
+        name != "runtime_user")
       throw std::runtime_error("unsupported bootstrap field; remove " + name);
   }
+  if (config.isMember("runtime_user"))
+    (void)ResolveRuntimeUser(Text(config, "runtime_user", 256));
   if (config.isMember("allow_insecure_localhost")) {
 #ifdef TELEOP_PRODUCTION_BUILD
     throw std::runtime_error(
@@ -274,6 +310,11 @@ Bootstrap::Bootstrap(Json::Value config, Hooks hooks, Storage storage)
     : config_(ParseBootstrapConfig(std::move(config))),
       hooks_(std::move(hooks)),
       storage_(storage) {
+  if (config_.isMember("runtime_user")) {
+    if (geteuid() != 0)
+      throw std::runtime_error("managed runtime enrollment requires root");
+    runtime_user_ = ResolveRuntimeUser(config_["runtime_user"].asString());
+  }
   if (!hooks_.now)
     hooks_.now = [] {
       return std::chrono::duration_cast<std::chrono::seconds>(
@@ -910,7 +951,8 @@ Json::Value DefaultCameraCaptureConfiguration() {
 }
 
 bool PrepareCameraCaptureConfiguration(const Json::Value& runtime,
-                                       Storage storage) {
+                                       Storage storage,
+                                       const RuntimeUser* user) {
   if (!runtime.isObject() || !runtime.isMember("camera_capture_config"))
     throw std::runtime_error("camera preparation requires runtime defaults");
   if (runtime["camera_capture_config"].isNull()) return false;
@@ -921,9 +963,18 @@ bool PrepareCameraCaptureConfiguration(const Json::Value& runtime,
   for (const auto& part : path)
     if (part == "..")
       throw std::runtime_error("camera configuration parent traversal is forbidden");
-  storage.EnsureDirectory(path.parent_path().string());
-  if (!storage.Read(path.string(), true, 16384).isNull()) return false;
-  storage.Write(path.string(), DefaultCameraCaptureConfiguration());
+  if (user)
+    storage.EnsureRuntimeDirectory(path.parent_path().string(), *user);
+  else
+    storage.EnsureDirectory(path.parent_path().string());
+  if (!storage.Read(path.string(), true, 16384).isNull()) {
+    if (user) storage.ShareRuntimeFile(path.string(), *user);
+    return false;
+  }
+  if (user)
+    storage.WriteRuntime(path.string(), DefaultCameraCaptureConfiguration(), *user);
+  else
+    storage.Write(path.string(), DefaultCameraCaptureConfiguration());
   return true;
 }
 
@@ -952,7 +1003,8 @@ Json::Value MergeRuntimeDefaults(const Json::Value& existing,
 
 bool PrepareRuntimeDataDirectory(const Json::Value& runtime,
                                 const std::string& state_directory,
-                                Storage storage) {
+                                Storage storage,
+                                const RuntimeUser* user) {
   if (!runtime.isObject() || !runtime.isMember("data_store_path"))
     throw std::runtime_error("data directory preparation requires runtime defaults");
   if (runtime["data_store_path"].isNull()) return false;
@@ -970,6 +1022,23 @@ bool PrepareRuntimeDataDirectory(const Json::Value& runtime,
   if (directory == directory.root_path() ||
       (!relative.empty() && *relative.begin() != ".."))
     throw std::runtime_error("data store requires a directory outside bootstrap state");
+  if (user) {
+    storage.EnsureRuntimeDirectory(directory.parent_path().string(), *user);
+    storage.EnsureDataDirectory(directory.string(), *user);
+    for (const auto* suffix : {"", ".lock", "-wal", "-shm"}) {
+      const auto file = path.string() + suffix;
+      struct stat info {};
+      if (lstat(file.c_str(), &info)) {
+        if (errno == ENOENT) continue;
+        throw std::runtime_error("cannot inspect existing runtime database file");
+      }
+      if (!S_ISREG(info.st_mode) || info.st_uid != user->uid ||
+          info.st_gid != user->gid || (info.st_mode & 07777) != 0600 ||
+          info.st_nlink != 1)
+        throw std::runtime_error("existing database files need offline ownership migration");
+    }
+    return true;
+  }
   struct stat info {};
   if (lstat(directory.c_str(), &info) == 0) {
     if (!S_ISDIR(info.st_mode) || info.st_uid != geteuid() ||
@@ -980,6 +1049,48 @@ bool PrepareRuntimeDataDirectory(const Json::Value& runtime,
   }
   storage.EnsureDirectory(directory.string());
   return true;
+}
+
+void ValidateRuntimeLayout(const Json::Value& config,
+                           const Json::Value& runtime,
+                           const std::string& bootstrap_config) {
+  const auto path = [](const std::string& text) {
+    const std::filesystem::path value(text);
+    if (!value.is_absolute() || value.filename().empty())
+      throw std::runtime_error("managed runtime paths must be absolute and dedicated");
+    for (const auto& part : value)
+      if (part == "." || part == "..")
+        throw std::runtime_error("managed runtime paths forbid parent traversal");
+    return value.lexically_normal();
+  };
+  const auto within = [](const std::filesystem::path& child,
+                         const std::filesystem::path& parent) {
+    const auto relative = child.lexically_relative(parent);
+    return !relative.empty() && *relative.begin() != "..";
+  };
+  const auto state = path(config["state_directory"].asString());
+  const auto bootstrap = path(bootstrap_config);
+  std::vector<std::filesystem::path> files{
+      path(config["device_config"].asString()),
+      path(config["credentials_config"].asString())};
+  if (!runtime["camera_capture_config"].isNull())
+    files.push_back(path(runtime["camera_capture_config"].asString()));
+  for (std::size_t i = 0; i < files.size(); ++i) {
+    if (files[i] == bootstrap || within(files[i], state))
+      throw std::runtime_error("runtime files must be separate from bootstrap secrets");
+    for (std::size_t j = 0; j < i; ++j)
+      if (files[i] == files[j])
+        throw std::runtime_error("runtime configuration files must have distinct paths");
+  }
+  if (!runtime["data_store_path"].isNull()) {
+    const auto directory = path(runtime["data_store_path"].asString()).parent_path();
+    if (directory == directory.root_path() || within(directory, state) ||
+        within(state, directory) || within(bootstrap, directory))
+      throw std::runtime_error("runtime data must be isolated from bootstrap secrets");
+    for (const auto& file : files)
+      if (within(file, directory))
+        throw std::runtime_error("runtime data must not contain protected configuration");
+  }
 }
 
 void Bootstrap::InstallConfiguration(const Json::Value& credentials) {
@@ -1000,10 +1111,16 @@ void Bootstrap::InstallConfiguration(const Json::Value& credentials) {
       state_["credentials_updated"] = true;
       Save();
     }
-    storage_.Write(auth_path, credentials);
+    if (runtime_user_)
+      storage_.WriteRuntime(auth_path, credentials, *runtime_user_);
+    else
+      storage_.Write(auth_path, credentials);
   }
   if (runtime != existing) {
-    storage_.Write(path, runtime);
+    if (runtime_user_)
+      storage_.WriteRuntime(path, runtime, *runtime_user_);
+    else
+      storage_.Write(path, runtime);
     hooks_.notice(existing.isNull()
                       ? "Created complete runtime defaults; media, control and "
                         "tasks remain disabled."

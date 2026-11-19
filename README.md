@@ -122,28 +122,50 @@ credentials reference. Split production files support root-owned `0600`, or
 root-owned dedicated-group `0640` under a protected `0750` directory; atomic
 root rotation preserves existing group and mode. Non-root manual enrollment
 uses `--config PATH` with explicit account-owned `0600` files and `0700` paths.
-Database-directory preparation belongs to the runtime account. For the root
-runtime, the Apollo enrollment wrapper calls
-`vehicle_bootstrap --prepare-data-directory --gateway-url HTTPS_URL` before
-enrollment. This offline command reads the protected bootstrap/runtime files,
+
+Root-managed enrollment accepts `--runtime-user USER`, resolved inside the
+container to an existing non-root UID and non-root primary GID. Selection is
+explicit option, saved `runtime_user` in the protected bootstrap config, then
+non-root `SUDO_USER` for Gateway-address commands. Direct root invocation without
+a saved account must supply the option. A different saved account is rejected;
+identity/data migration is a separate offline operation. The account is not a
+runtime `device.json` field or part of the server enrollment payload.
+The Apollo wrapper validates first, saves the account with `--configure`, prepares
+data and camera paths, then enrolls. Root-managed enrollment also performs these
+preparations when invoked directly. Existing runtime values and device keys are
+preserved. Bootstrap config, key/state and lock remain private to root. Runtime
+config, credentials and cameras are root-owned `0640` with the runtime's primary
+group, under dedicated protected `0750` parents. New files and atomic replacements
+use the same policy. Compatible existing root-owned `0600` runtime files are
+shared without replacing their contents; unrelated groups are rejected.
+
+The Apollo wrapper calls `vehicle_bootstrap --prepare-data-directory
+--gateway-url HTTPS_URL --runtime-user USER` before enrollment. This offline
+command reads the protected bootstrap/runtime files,
 uses the same missing-key defaults as installation, preserves custom paths and
 skips explicit null. It prepares the runtime configuration parent if absent and
-the private database parent (`0700`), but does not write configuration, create
+the private database parent (`0700`, owned by the selected runtime account), but
+does not write configuration, create
 SQLite files, generate keys or start services. Existing data directories with
 incorrect owners/permissions, symlinks, parent traversal and paths inside the
-bootstrap state directory are rejected; existing permissions are never changed.
+bootstrap state directory are rejected. Existing data ownership is never
+changed. Existing database, lock, WAL and SHM files must belong to the runtime
+account and primary group with mode `0600`; otherwise offline migration is
+required. Only the named root-owned shared configuration/data parents are
+prepared as `0750`; no recursive ownership changes are performed.
 When using bootstrap directly, prepare storage explicitly. A non-root runtime
 must use its own data directory and run
 `vehicle_bootstrap --prepare-data-directory --config PATH` as that account
-with its protected bootstrap config. The root wrapper must not be used to
-provision its database. SQLite files and tables
+with its protected bootstrap config. Fully non-root enrollment remains supported
+without the root-managed `runtime_user` field. SQLite files and tables
 are created by the Apollo runtime on startup, not by enrollment. Persist the
 data directory outside the container writable layer if containers are replaced.
 The wrapper also calls `vehicle_bootstrap --prepare-camera-config --gateway-url
-HTTPS_URL`. `DefaultCameraCaptureConfiguration` supplies three devices
+HTTPS_URL --runtime-user USER`. `DefaultCameraCaptureConfiguration` supplies three devices
 (`/dev/video0`, `/dev/video1`, `/dev/video2`), 1920x1080 at 30 fps, 1280x720
 output, 2000000 bps and keyframe interval 30. The command creates a missing
-protected camera JSON as `0600`, preserves existing files and custom paths, and
+protected camera JSON as root-owned runtime-group `0640` in root-managed mode
+(`0600` for fully non-root mode), preserves existing contents and custom paths, and
 skips explicit null. It performs no camera or network operations and changes
 no runtime switches. Non-root preparation accepts `--prepare-camera-config
 --config PATH` with a protected bootstrap config. Use the matching Apollo

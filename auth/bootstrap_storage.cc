@@ -48,7 +48,8 @@ void CheckFile(int fd, uid_t owner) {
         "protected file requires owner, 0600 and one link");
 }
 // Resolve every directory component without following symlinks.
-int Directory(const std::string& path, uid_t owner, bool create = false) {
+int Directory(const std::string& path, uid_t owner, bool create = false,
+              gid_t runtime_group = 0) {
   if (path.empty()) throw std::runtime_error("empty storage directory");
   int current =
       open(path.front() == '/' ? "/" : ".", O_RDONLY | O_DIRECTORY | O_CLOEXEC);
@@ -71,15 +72,31 @@ int Directory(const std::string& path, uid_t owner, bool create = false) {
       close(current);
       throw std::runtime_error("parent traversal forbidden");
     }
-    if (create && mkdirat(current, part.c_str(), 0700) && errno != EEXIST) {
-      close(current);
-      throw std::runtime_error("cannot create protected directory");
+    bool created = false;
+    if (create) {
+      created = mkdirat(current, part.c_str(), 0700) == 0;
+      if (!created && errno != EEXIST) {
+        close(current);
+        throw std::runtime_error("cannot create protected directory");
+      }
     }
     int next = openat(current, part.c_str(),
                       O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
     if (next < 0) {
       close(current);
       throw std::runtime_error("cannot open storage directory");
+    }
+    if (created && runtime_group != 0 &&
+        (fchown(next, 0, runtime_group) || fchmod(next, 0750) || fsync(next))) {
+      close(current);
+      close(next);
+      throw std::runtime_error("cannot create runtime configuration directory");
+    }
+    if (created && runtime_group == 0 && owner == 0 &&
+        (fchown(next, 0, 0) || fchmod(next, 0700) || fsync(next))) {
+      close(current);
+      close(next);
+      throw std::runtime_error("cannot create private root directory");
     }
     if (create && fsync(current)) {
       close(current);
@@ -94,9 +111,24 @@ int Directory(const std::string& path, uid_t owner, bool create = false) {
       throw std::runtime_error(
           "storage directory must not be publicly writable");
     }
+    if (runtime_group != 0 && start < path.size() &&
+        ((s.st_gid == runtime_group ? (s.st_mode >> 3) : s.st_mode) & 5) != 5) {
+      close(next);
+      throw std::runtime_error("runtime cannot traverse configuration parents");
+    }
     current = next;
   }
   return current;
+}
+void RuntimeOwner(uid_t owner, const RuntimeUser& user) {
+  if (owner != 0 || geteuid() != 0 || user.uid == 0 || user.gid == 0)
+    throw std::runtime_error("runtime provisioning requires root and non-root runtime");
+}
+void RuntimeFile(int fd, const RuntimeUser& user) {
+  CheckFile(fd, 0);
+  struct stat info {};
+  if (fstat(fd, &info) || (info.st_gid != 0 && info.st_gid != user.gid))
+    throw std::runtime_error("runtime file group change requires explicit migration");
 }
 std::pair<std::string, std::string> Split(const std::string& path) {
   if (path.empty() || path.back() == '/')
@@ -120,6 +152,60 @@ void Storage::EnsureDirectory(const std::string& path) const {
        !((s.st_mode & 07777) == 0750 && owner_ == 0 && s.st_gid != 0)) ||
       fsync(directory.get()))
     throw std::runtime_error("cannot protect storage directory");
+}
+
+void Storage::EnsureRuntimeDirectory(const std::string& path,
+                                     const RuntimeUser& user) const {
+  RuntimeOwner(owner_, user);
+  FD directory(Directory(path, owner_, true, user.gid));
+  struct stat info {};
+  if (fstat(directory.get(), &info) || info.st_uid != 0 ||
+      (info.st_gid != 0 && info.st_gid != user.gid) ||
+      ((info.st_mode & 07777) != 0700 &&
+       (info.st_mode & 07777) != 0750))
+    throw std::runtime_error("runtime configuration requires a dedicated protected directory");
+  if (fchown(directory.get(), 0, user.gid) ||
+      fchmod(directory.get(), 0750) || fsync(directory.get()))
+    throw std::runtime_error("cannot share runtime configuration directory");
+}
+
+void Storage::ShareRuntimeFile(const std::string& path,
+                               const RuntimeUser& user) const {
+  RuntimeOwner(owner_, user);
+  const auto parts = Split(path);
+  FD dir(Directory(parts.first, owner_));
+  const int raw = openat(dir.get(), parts.second.c_str(),
+                        O_RDONLY | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC);
+  if (raw < 0 && errno == ENOENT) return;
+  FD file(raw);
+  RuntimeFile(file.get(), user);
+  if (fchown(file.get(), 0, user.gid) || fchmod(file.get(), 0640) ||
+      fsync(file.get()))
+    throw std::runtime_error("cannot share protected runtime file");
+}
+
+void Storage::EnsureDataDirectory(const std::string& path,
+                                  const RuntimeUser& user) const {
+  RuntimeOwner(owner_, user);
+  const auto parts = Split(path);
+  // The parent is root-owned, so the runtime cannot replace the directory.
+  FD parent(Directory(parts.first, owner_));
+  const bool created = mkdirat(parent.get(), parts.second.c_str(), 0700) == 0;
+  if (!created && errno != EEXIST)
+    throw std::runtime_error("cannot create runtime data directory");
+  FD dir(openat(parent.get(), parts.second.c_str(),
+                O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC));
+  struct stat info {};
+  if (fstat(dir.get(), &info))
+    throw std::runtime_error("cannot inspect runtime data directory");
+  if (created) {
+    if (info.st_uid != 0 || fchown(dir.get(), user.uid, user.gid) ||
+        fchmod(dir.get(), 0700) || fsync(dir.get()) || fsync(parent.get()))
+      throw std::runtime_error("cannot assign runtime data directory");
+  } else if (info.st_uid != user.uid || info.st_gid != user.gid ||
+             (info.st_mode & 07777) != 0700) {
+    throw std::runtime_error("existing data directory needs offline ownership migration");
+  }
 }
 
 void Storage::Remove(const std::string& path) const {
@@ -167,16 +253,28 @@ Json::Value Storage::Read(const std::string& path, bool optional,
 }
 
 void Storage::Write(const std::string& path, const Json::Value& value) const {
+  WriteFile(path, value, nullptr);
+}
+
+void Storage::WriteRuntime(const std::string& path, const Json::Value& value,
+                           const RuntimeUser& user) const {
+  RuntimeOwner(owner_, user);
+  WriteFile(path, value, &user);
+}
+
+void Storage::WriteFile(const std::string& path, const Json::Value& value,
+                        const RuntimeUser* user) const {
   if (geteuid() != owner_) throw std::runtime_error("incorrect storage owner");
   auto parts = Split(path);
   FD dir(Directory(parts.first, owner_));
   int existing = openat(dir.get(), parts.second.c_str(),
                         O_RDONLY | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC);
   mode_t mode = 0600;
-  gid_t group = getegid();
+  gid_t group = owner_ == 0 ? 0 : getegid();
   if (existing >= 0) {
     FD old(existing);
     CheckFile(old.get(), owner_);
+    if (user) RuntimeFile(old.get(), *user);
     struct stat previous {};
     if (fstat(old.get(), &previous))
       throw std::runtime_error("cannot inspect protected destination");
@@ -184,6 +282,10 @@ void Storage::Write(const std::string& path, const Json::Value& value) const {
     group = previous.st_gid;
   } else if (errno != ENOENT) {
     throw std::runtime_error("unsafe destination");
+  }
+  if (user) {
+    group = user->gid;
+    mode = 0640;
   }
   Json::StreamWriterBuilder writer;
   writer["indentation"] = "  ";
@@ -215,9 +317,16 @@ void Storage::Write(const std::string& path, const Json::Value& value) const {
 int Storage::Lock(const std::string& directory) const {
   FD dir(Directory(directory, owner_));
   int fd = openat(dir.get(), "lock",
-                  O_RDWR | O_CREAT | O_NOFOLLOW | O_CLOEXEC | O_NONBLOCK, 0600);
+                  O_RDWR | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC | O_NONBLOCK,
+                  0600);
+  const bool created = fd >= 0;
+  if (fd < 0 && errno == EEXIST)
+    fd = openat(dir.get(), "lock", O_RDWR | O_NOFOLLOW | O_CLOEXEC | O_NONBLOCK);
   if (fd < 0) throw std::runtime_error("cannot lock bootstrap");
   try {
+    if (created && (fchown(fd, owner_, owner_ == 0 ? 0 : getegid()) ||
+                    fchmod(fd, 0600)))
+      throw std::runtime_error("cannot protect bootstrap lock");
     CheckFile(fd, owner_);
     if (flock(fd, LOCK_EX | LOCK_NB))
       throw std::runtime_error("bootstrap already running");
