@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+#include "vehicle_edge/auth_client.h"
 #include "vehicle_edge/diagnostics.h"
 #include "vehicle_edge/http_client.h"
 
@@ -28,6 +29,7 @@
 #include <cstring>
 #include <iostream>
 #include <memory>
+#include <sstream>
 #include <stdexcept>
 #include <string>
 #include <thread>
@@ -632,6 +634,89 @@ void InterimHeadersAndNewGatewayCodesAreHandled() {
           "planned Gateway error code was not safely recognized");
 }
 
+void TransportTimingAndRedaction() {
+  LocalHTTPServer server({{503, "synthetic-response-secret"},
+                          {200, "synthetic-response-secret"}});
+  vehicle_edge::HTTPClient client;
+  const auto response = client.Post(
+      server.URL() + "/api/vehicles/synthetic-private-vehicle/data/health",
+      "application/json", "synthetic-request-secret", "synthetic-bearer", true,
+      vehicle_edge::HTTPTimeouts{3000, 5000});
+  const auto unknown = client.Get(
+      server.URL() + "/synthetic-path-secret", "synthetic-bearer", true);
+  server.Finish();
+  Require(response.status == 503 && response.body == "synthetic-response-secret",
+          "diagnostic collection changed the HTTP response");
+  Require(response.diagnostics.find("request=data_health") != std::string::npos &&
+              response.diagnostics.find("method=POST") != std::string::npos &&
+              response.diagnostics.find("host=127.0.0.1") != std::string::npos &&
+              response.diagnostics.find("http_status=503") != std::string::npos &&
+              response.diagnostics.find("curl_code=0") != std::string::npos,
+          "request category or HTTP status missing from transport diagnostics");
+  Require(unknown.diagnostics.find("request=http") != std::string::npos,
+          "unknown endpoint was not assigned a fixed category");
+  Require(response.diagnostics.find("connect_timeout_ms=3000 timeout_ms=5000") !=
+              std::string::npos &&
+              unknown.diagnostics.find("connect_timeout_ms=1000 timeout_ms=2000") !=
+                  std::string::npos,
+          "per-request timeout override was lost or leaked into the next request");
+  for (const auto *field : {"dns_ms=", "connect_ms=", "tls_ms=",
+                            "first_byte_ms=", "total_ms=", "new_connections="})
+    Require(response.diagnostics.find(field) != std::string::npos,
+            "HTTP phase timing missing");
+  for (const auto &diagnostics : {response.diagnostics, unknown.diagnostics}) {
+    for (const auto *secret : {"synthetic-response-secret", "synthetic-request-secret",
+                               "synthetic-bearer", "synthetic-private-vehicle",
+                               "synthetic-path-secret", "/api/vehicles/"})
+      Require(diagnostics.find(secret) == std::string::npos,
+              "HTTP diagnostics exposed request/response material or raw URL path");
+  }
+}
+
+void OAuthTimeoutRetainsSafeDetails() {
+  LocalHTTPServer server({{200, "synthetic-response-secret", "", "", "", "", 10300}});
+  vehicle_edge::SharedTokenProvider provider(Config(server.URL()));
+  std::string message;
+  try {
+    (void)provider.GetToken();
+  } catch (const vehicle_edge::AuthClientError &error) {
+    Require(error.code() == "oauth_transport_error", "OAuth error code changed");
+    message = error.what();
+  }
+  server.Finish();
+  Require(message.find("request=oauth_token") != std::string::npos &&
+              message.find("curl_code=28") != std::string::npos &&
+              message.find("total_ms=") != std::string::npos &&
+              message.find("connect_timeout_ms=5000 timeout_ms=10000") != std::string::npos,
+          "OAuth wrapper discarded transport timeout diagnostics or changed limits");
+  for (const auto *secret : {"synthetic-client", "synthetic-client-secret",
+                             "synthetic-response-secret", "grant_type="})
+    Require(message.find(secret) == std::string::npos,
+            "OAuth timeout exposed credentials or response content");
+}
+
+void SlowRequestLogIsBoundedAndSafe() {
+  LocalHTTPServer server({{200, "synthetic-response-secret", "", "", "", "", 1100},
+                          {200, "synthetic-response-secret", "", "", "", "", 1100}});
+  struct Capture {
+    std::ostringstream output;
+    std::streambuf *previous = std::cerr.rdbuf(output.rdbuf());
+    ~Capture() { std::cerr.rdbuf(previous); }
+  } capture;
+  vehicle_edge::HTTPClient client;
+  (void)client.Get(server.URL() + "/synthetic-path-secret", "synthetic-bearer", true);
+  (void)client.Get(server.URL() + "/synthetic-path-secret", "synthetic-bearer", true);
+  server.Finish();
+  const auto log = capture.output.str();
+  const auto first = log.find("HTTP request slow:");
+  Require(first != std::string::npos &&
+              log.find("HTTP request slow:", first + 1) == std::string::npos &&
+              log.find("total_ms=") != std::string::npos,
+          "slow request diagnostics missing or not rate limited");
+  Require(log.find("synthetic-") == std::string::npos,
+          "slow request log exposed response, path or bearer token");
+}
+
 } // namespace
 
 int main() {
@@ -646,6 +731,9 @@ int main() {
     InvalidRequestIDIsDiscarded();
     LocalSimDebugAuthAndProtectedFile();
     InterimHeadersAndNewGatewayCodesAreHandled();
+    TransportTimingAndRedaction();
+    OAuthTimeoutRetainsSafeDetails();
+    SlowRequestLogIsBoundedAndSafe();
   } catch (const std::exception &error) {
     std::cerr << error.what() << '\n';
     return 1;

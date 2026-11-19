@@ -23,6 +23,8 @@
 namespace vehicle_edge {
 namespace {
 
+constexpr HTTPTimeouts kOAuthTimeouts{5000, 10000};
+
 void ValidateAPIPath(const std::string &path) {
   if (path.rfind("/api/", 0) != 0 ||
       std::any_of(path.begin(), path.end(),
@@ -84,7 +86,12 @@ void SharedTokenProvider::AcquireLocked() {
                          "&client_secret=" +
                          http_.Escape(config_.client_secret) +
                          "&scope=teleop%3Avehicle",
-                     "", config_.allow_insecure_localhost);
+                     "", config_.allow_insecure_localhost, kOAuthTimeouts);
+    } catch (const HTTPTransportError &error) {
+      throw AuthClientError(
+          "oauth_transport_error",
+          std::string("OAuth token request failed at the transport: ") +
+              error.what());
     } catch (...) {
       throw AuthClientError("oauth_transport_error",
                             "OAuth token request failed at the transport");
@@ -102,8 +109,10 @@ void SharedTokenProvider::AcquireLocked() {
         continue;
       throw AuthClientError(
           invalid_client ? "oauth_invalid_client" : "oauth_http_error",
-          invalid_client ? "OAuth rejected the configured client credentials"
-                         : "OAuth token endpoint rejected the request",
+          std::string(invalid_client
+                          ? "OAuth rejected the configured client credentials"
+                          : "OAuth token endpoint rejected the request") +
+              ": " + response.diagnostics,
           response.status);
     }
     Json::Value value;
@@ -172,7 +181,8 @@ void AuthenticatedClient::AcquireToken() {
   (void)token_provider_->GetToken();
 }
 
-HTTPResponse AuthenticatedClient::Get(const std::string &path) {
+HTTPResponse AuthenticatedClient::Get(const std::string &path,
+                                      HTTPTimeouts timeouts) {
   ValidateAPIPath(path);
   if (config_.IsLocalSimDebug() && !LoopbackURL(config_.gateway_url)) {
     throw std::invalid_argument(
@@ -180,7 +190,7 @@ HTTPResponse AuthenticatedClient::Get(const std::string &path) {
   }
   const auto token = token_provider_->GetToken();
   auto response = http_.Get(config_.gateway_url + path, token,
-                            config_.allow_insecure_localhost);
+                            config_.allow_insecure_localhost, timeouts);
   if (response.status == 401) {
     token_provider_->InvalidateToken(token);
   }
@@ -188,7 +198,8 @@ HTTPResponse AuthenticatedClient::Get(const std::string &path) {
 }
 
 HTTPResponse AuthenticatedClient::Post(const std::string &path,
-                                       const std::string &body) {
+                                       const std::string &body,
+                                       HTTPTimeouts timeouts) {
   ValidateAPIPath(path);
   if (config_.IsLocalSimDebug() && !LoopbackURL(config_.gateway_url)) {
     throw std::invalid_argument(
@@ -199,7 +210,8 @@ HTTPResponse AuthenticatedClient::Post(const std::string &path,
   }
   const auto token = token_provider_->GetToken();
   auto response = http_.Post(config_.gateway_url + path, "application/json",
-                             body, token, config_.allow_insecure_localhost);
+                             body, token, config_.allow_insecure_localhost,
+                             timeouts);
   if (response.status == 401) {
     token_provider_->InvalidateToken(token);
   }

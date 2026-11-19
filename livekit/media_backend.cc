@@ -61,7 +61,8 @@ bool ValidEndpointScheme(const std::string &url, const char *s1,
 
 std::string FetchMediaTokenFallback(const MediaWorkerConfig &config) {
   AuthenticatedClient client(config);
-  const auto response = client.Get("/api/token/vehicle");
+  const auto response =
+      client.Get("/api/token/vehicle", HTTPTimeouts{3000, 5000});
   if (response.status != 200)
     throw std::runtime_error("device request rejected (HTTP " +
                              std::to_string(response.status) + ")");

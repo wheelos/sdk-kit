@@ -16,8 +16,12 @@
 
 #include <algorithm>
 #include <cctype>
+#include <iomanip>
+#include <iostream>
 #include <iterator>
+#include <locale>
 #include <memory>
+#include <sstream>
 #include <stdexcept>
 #include <string_view>
 
@@ -25,6 +29,79 @@ namespace vehicle_edge {
 namespace {
 
 constexpr std::size_t kMaxResponseBytes = 65536;
+
+std::string URLPart(const std::string &url, CURLUPart part) {
+  std::unique_ptr<CURLU, decltype(&curl_url_cleanup)> parsed(curl_url(),
+                                                          curl_url_cleanup);
+  if (!parsed || curl_url_set(parsed.get(), CURLUPART_URL, url.c_str(), 0) !=
+                     CURLUE_OK)
+    return {};
+  char *raw = nullptr;
+  if (curl_url_get(parsed.get(), part, &raw, 0) != CURLUE_OK)
+    return {};
+  std::unique_ptr<char, decltype(&curl_free)> value(raw, curl_free);
+  return raw ? std::string(raw) : std::string();
+}
+
+const char *RequestCategory(const std::string &path, bool oauth) {
+  if (oauth) return "oauth_token";
+  if (path == "/api/token/vehicle") return "media_token";
+  if (path == "/api/get-account") return "gateway_identity";
+  const std::string prefix = "/api/vehicles/";
+  if (path.rfind(prefix, 0) != 0) return "http";
+  const auto slash = path.find('/', prefix.size());
+  if (slash == std::string::npos || slash == prefix.size()) return "http";
+  const auto route = path.substr(slash);
+  if (route == "/state") return "telemetry";
+  if (route == "/mission-status") return "mission_status";
+  if (route == "/media-demand") return "media_demand";
+  if (route == "/control/context") return "control_context";
+  if (route == "/control/simulation-ack") return "control_simulation_ack";
+  if (route == "/data/health") return "data_health";
+  if (route == "/data/profile") return "data_profile";
+  if (route == "/data/diagnostics") return "data_diagnostics";
+  if (route == "/data/events") return "data_events";
+  if (route == "/data/task-results") return "data_task_results";
+  if (route == "/data/tasks/next") return "data_task_pull";
+  return "http";
+}
+
+double Seconds(CURL *handle, CURLINFO field) {
+  double seconds = 0;
+  return curl_easy_getinfo(handle, field, &seconds) == CURLE_OK ? seconds : -1;
+}
+
+std::string TransportSummary(CURL *handle, const std::string &url, bool post,
+                             bool oauth, CURLcode code, long http_status,
+                             HTTPTimeouts timeouts) {
+  auto host = URLPart(url, CURLUPART_HOST);
+  if (host.empty() || host.size() > 253 ||
+      !std::all_of(host.begin(), host.end(), [](unsigned char ch) {
+        return (ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') ||
+               (ch >= '0' && ch <= '9') || ch == '.' || ch == '-' ||
+               ch == ':' || ch == '[' || ch == ']';
+      }))
+    host = "redacted";
+  long connections = 0;
+  (void)curl_easy_getinfo(handle, CURLINFO_NUM_CONNECTS, &connections);
+  std::ostringstream out;
+  out.imbue(std::locale::classic());
+  out << std::fixed << std::setprecision(1)
+      << "request=" << RequestCategory(URLPart(url, CURLUPART_PATH), oauth)
+      << " method=" << (post ? "POST" : "GET") << " host=" << host
+      << " curl_code=" << static_cast<int>(code)
+      << " curl_error=\"" << curl_easy_strerror(code) << "\""
+      << " http_status=" << http_status
+      << " dns_ms=" << Seconds(handle, CURLINFO_NAMELOOKUP_TIME) * 1000
+      << " connect_ms=" << Seconds(handle, CURLINFO_CONNECT_TIME) * 1000
+      << " tls_ms=" << Seconds(handle, CURLINFO_APPCONNECT_TIME) * 1000
+      << " first_byte_ms=" << Seconds(handle, CURLINFO_STARTTRANSFER_TIME) * 1000
+      << " total_ms=" << Seconds(handle, CURLINFO_TOTAL_TIME) * 1000
+      << " new_connections=" << connections
+      << " connect_timeout_ms=" << timeouts.connect_ms
+      << " timeout_ms=" << timeouts.total_ms;
+  return out.str();
+}
 
 std::size_t Receive(char *data, std::size_t size, std::size_t count,
                     void *context) {
@@ -156,22 +233,28 @@ HTTPResponse HTTPClient::Post(const std::string &url,
                               const std::string &content_type,
                               const std::string &body,
                               const std::string &bearer,
-                              bool allow_insecure_localhost) {
+                              bool allow_insecure_localhost,
+                              HTTPTimeouts timeouts) {
   return Request(url, content_type, body, bearer, allow_insecure_localhost,
-                 true);
+                 true, timeouts);
 }
 
 HTTPResponse HTTPClient::Get(const std::string &url, const std::string &bearer,
-                             bool allow_insecure_localhost) {
+                             bool allow_insecure_localhost,
+                             HTTPTimeouts timeouts) {
   return Request(url, "application/json", "", bearer, allow_insecure_localhost,
-                 false);
+                 false, timeouts);
 }
 
 HTTPResponse HTTPClient::Request(const std::string &url,
                                  const std::string &content_type,
                                  const std::string &body,
                                  const std::string &bearer,
-                                 bool allow_insecure_localhost, bool post) {
+                                 bool allow_insecure_localhost, bool post,
+                                 HTTPTimeouts timeouts) {
+  if (timeouts.connect_ms <= 0 || timeouts.total_ms <= 0) {
+    throw std::invalid_argument("HTTP timeouts must be positive");
+  }
   if (!AllowedURL(url, allow_insecure_localhost) ||
       (!bearer.empty() && !ValidBearerToken(bearer))) {
     throw std::invalid_argument("invalid request endpoint or token");
@@ -207,8 +290,8 @@ HTTPResponse HTTPClient::Request(const std::string &url,
   } else {
     Check(curl_easy_setopt(handle_, CURLOPT_HTTPGET, 1L));
   }
-  Check(curl_easy_setopt(handle_, CURLOPT_CONNECTTIMEOUT_MS, 1000L));
-  Check(curl_easy_setopt(handle_, CURLOPT_TIMEOUT_MS, 2000L));
+  Check(curl_easy_setopt(handle_, CURLOPT_CONNECTTIMEOUT_MS, timeouts.connect_ms));
+  Check(curl_easy_setopt(handle_, CURLOPT_TIMEOUT_MS, timeouts.total_ms));
   Check(curl_easy_setopt(handle_, CURLOPT_NOSIGNAL, 1L));
   Check(curl_easy_setopt(handle_, CURLOPT_FOLLOWLOCATION, 0L));
   Check(curl_easy_setopt(handle_, CURLOPT_SSL_VERIFYPEER, 1L));
@@ -218,11 +301,20 @@ HTTPResponse HTTPClient::Request(const std::string &url,
   Check(curl_easy_setopt(handle_, CURLOPT_HEADERFUNCTION, ReceiveHeader));
   Check(curl_easy_setopt(handle_, CURLOPT_HEADERDATA, &response));
   const auto status = curl_easy_perform(handle_);
+  const auto info_status =
+      curl_easy_getinfo(handle_, CURLINFO_RESPONSE_CODE, &response.status);
+  response.diagnostics = TransportSummary(
+      handle_, url, post, post && content_type == "application/x-www-form-urlencoded",
+      status, response.status, timeouts);
   if (status != CURLE_OK) {
-    throw std::runtime_error("HTTP transport failed (curl code " +
-                             std::to_string(static_cast<int>(status)) + ")");
+    throw HTTPTransportError(status, response.diagnostics);
   }
-  Check(curl_easy_getinfo(handle_, CURLINFO_RESPONSE_CODE, &response.status));
+  Check(info_status);
+  const auto now = std::chrono::steady_clock::now();
+  if (Seconds(handle_, CURLINFO_TOTAL_TIME) >= 1.0 && now >= next_slow_log_) {
+    std::cerr << "HTTP request slow: " + response.diagnostics + "\n";
+    next_slow_log_ = now + std::chrono::seconds(30);
+  }
   return response;
 }
 

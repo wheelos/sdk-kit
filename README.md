@@ -51,6 +51,35 @@ bazel build //...
 bazel test //...
 ```
 
+## Runtime HTTP diagnostics
+
+`HTTPResponse::diagnostics` carries a redacted transport summary: fixed request
+category, method, host, curl code, HTTP status, cumulative DNS/TCP/TLS/first-byte
+timings and total elapsed milliseconds. URL paths, request/response bodies,
+headers and credentials are excluded. `HTTPTransportError` preserves the curl
+code and this summary; OAuth transport errors retain it rather than discarding
+the underlying cause. Callers can append the summary when rejecting an HTTP
+status without logging the response body.
+
+Transport-completed requests taking at least 1000 ms emit a slow-request log,
+limited to one message per HTTP client per 30 seconds. Zero phase timings can
+mean a phase was not reached or the connection was reused; `new_connections`
+helps distinguish reuse.
+
+`HTTPClient` and `AuthenticatedClient` accept an optional per-request
+`HTTPTimeouts{connect_ms, total_ms}` argument. Both values must be positive;
+the default is 1000/2000 ms. OAuth token acquisition through
+`SharedTokenProvider` uses 5000/10000 ms. Apollo Teleop data uploads explicitly
+select 3000/5000 ms. Media token acquisition at /api/token/vehicle also uses
+3000/5000 ms in the Teleop client, media worker and auth diagnostic. Media demand,
+control context and other callers retain the default unless they supply an
+override. Diagnostics report the actual
+`connect_timeout_ms` and `timeout_ms` selected for each transfer.
+
+The total HTTP timeout includes connection setup but excludes waiting for the
+shared token lock or a separate OAuth request. Shared-token locking, retries,
+media authorization expiry checks and bootstrap HTTP timeouts are unchanged.
+
 ## Enrollment configuration
 
 Normal `vehicle_bootstrap` configuration needs only `gateway_url`. Use a manual

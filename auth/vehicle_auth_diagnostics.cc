@@ -220,7 +220,8 @@ DiagnosticReport RunVehicleAuthDiagnostic(const AuthConfig &config) {
                            "vehicle LiveKit token issuance", started);
     HTTPResponse media;
     try {
-      media = client->Get("/api/token/vehicle");
+      media = client->Get("/api/token/vehicle",
+                          vehicle_edge::HTTPTimeouts{3000, 5000});
     } catch (const AuthClientError &error) {
       AddFailure(
           report, std::move(stage), error.code(),

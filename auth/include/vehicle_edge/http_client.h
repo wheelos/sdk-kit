@@ -14,6 +14,8 @@
 
 #pragma once
 
+#include <chrono>
+#include <stdexcept>
 #include <string>
 
 #include <curl/curl.h>
@@ -23,11 +25,34 @@
 
 namespace vehicle_edge {
 
+// Per-transfer limits in milliseconds. The total includes connection setup,
+// but not a caller's wait for a shared OAuth token.
+struct HTTPTimeouts {
+  long connect_ms = 1000;
+  long total_ms = 2000;
+};
+
 struct HTTPResponse {
   long status = 0;
   std::string body;
   std::string request_id;
   std::string error_code;
+  // Safe summary: fixed request category, host and cumulative curl timings.
+  // Never contains URL paths, headers, request bodies or response bodies.
+  std::string diagnostics;
+};
+
+class HTTPTransportError : public std::runtime_error {
+ public:
+  HTTPTransportError(CURLcode code, const std::string &diagnostics)
+      : std::runtime_error("HTTP transport failed (curl code " +
+                           std::to_string(static_cast<int>(code)) + "): " +
+                           diagnostics),
+        code_(code) {}
+  CURLcode code() const noexcept { return code_; }
+
+ private:
+  CURLcode code_;
 };
 
 Json::Value ParseHTTPJSON(const std::string &text);
@@ -43,17 +68,21 @@ class HTTPClient {
 
   HTTPResponse Post(const std::string &url, const std::string &content_type,
                     const std::string &body, const std::string &bearer,
-                    bool allow_insecure_localhost);
+                    bool allow_insecure_localhost,
+                    HTTPTimeouts timeouts = {});
   HTTPResponse Get(const std::string &url, const std::string &bearer,
-                   bool allow_insecure_localhost);
+                   bool allow_insecure_localhost,
+                   HTTPTimeouts timeouts = {});
   std::string Escape(const std::string &value) const;
 
  private:
   HTTPResponse Request(const std::string &url, const std::string &content_type,
                        const std::string &body, const std::string &bearer,
-                       bool allow_insecure_localhost, bool post);
+                       bool allow_insecure_localhost, bool post,
+                       HTTPTimeouts timeouts);
 
   CURL *handle_;
+  std::chrono::steady_clock::time_point next_slow_log_{};
 };
 
 }  // namespace vehicle_edge

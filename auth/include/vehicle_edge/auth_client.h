@@ -72,8 +72,9 @@ class AuthenticatedClient {
       std::shared_ptr<SharedTokenProvider> token_provider = nullptr);
 
   void AcquireToken();
-  HTTPResponse Get(const std::string &path);
-  HTTPResponse Post(const std::string &path, const std::string &body);
+  HTTPResponse Get(const std::string &path, HTTPTimeouts timeouts = {});
+  HTTPResponse Post(const std::string &path, const std::string &body,
+                    HTTPTimeouts timeouts = {});
 
   const AuthConfig &config() const noexcept { return config_; }
   const std::shared_ptr<SharedTokenProvider> &token_provider() const noexcept {
