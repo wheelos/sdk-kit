@@ -95,6 +95,41 @@ void Queue() {
           "camera2 delta accepted without camera2 IDR");
   Require(queue.Submit(cam2_idr, now) == FrameResult::ACCEPTED,
           "camera2 IDR rejected");
+  while (queue.Take(now)) {}
+
+  // Single-camera discontinuity resets only that camera, preserving healthy siblings,
+  // and marks the recovery IDR frame with discontinuity=true for the worker.
+  queue.Discontinuity(2);
+  auto cam0_delta = Frame(12, false);
+  cam0_delta.camera_index = 0;
+  auto cam2_after_discont = Frame(12, false);
+  cam2_after_discont.camera_index = 2;
+  auto cam2_recovery_idr = Frame(13, true);
+  cam2_recovery_idr.camera_index = 2;
+  auto cam2_next_delta = Frame(14, false);
+  cam2_next_delta.camera_index = 2;
+  Require(queue.Submit(cam0_delta, now) == FrameResult::ACCEPTED,
+          "single-camera discontinuity broke sibling camera0");
+  Require(queue.Submit(cam2_after_discont, now) ==
+              FrameResult::WAITING_KEYFRAME,
+          "single-camera discontinuity did not reset target camera2");
+  Require(queue.Submit(cam2_recovery_idr, now) == FrameResult::ACCEPTED,
+          "camera2 recovery IDR rejected");
+  Require(queue.Submit(cam2_next_delta, now) == FrameResult::ACCEPTED,
+          "camera2 post-recovery delta rejected");
+  bool saw_cam2_discontinuity_idr = false;
+  while (auto out = queue.Take(now)) {
+    if (out->camera_index == 0 && out->discontinuity)
+      throw std::runtime_error("sibling camera0 received spurious discontinuity");
+    if (out->camera_index == 2 && out->timestamp_us == 13)
+      saw_cam2_discontinuity_idr = out->discontinuity;
+    if (out->camera_index == 2 && out->timestamp_us == 14 && out->discontinuity)
+      throw std::runtime_error("post-recovery delta retained discontinuity");
+  }
+  Require(saw_cam2_discontinuity_idr,
+          "recovery IDR did not carry discontinuity flag to worker");
+  Require(queue.TakeFeedback().keyframe_requested,
+          "single-camera discontinuity did not request keyframe");
 }
 
 void Validation() {
@@ -131,18 +166,21 @@ void IPC() {
     auto frame = Frame(1);
     frame.camera_index = 2;
     frame.capture_time_us = 1700000000123456;
+    frame.discontinuity = true;
     Require(SendEncodedFrame(sockets[0], frame), "frame send failed");
     const auto received = ReceiveEncodedFrame(sockets[1]);
     Require(received && received->data == frame.data &&
                 received->timestamp_us == 1 && received->keyframe &&
+                received->discontinuity &&
                 received->width == 640 && received->sequence == 1 &&
                 received->camera_index == 2 &&
                 received->capture_time_us == frame.capture_time_us,
             "IPC metadata or payload corrupted");
     frame.capture_time_us = 0;
+    frame.discontinuity = false;
     Require(SendEncodedFrame(sockets[0], frame), "legacy frame send failed");
     const auto legacy = ReceiveEncodedFrame(sockets[1]);
-    Require(legacy && legacy->capture_time_us == 0,
+    Require(legacy && legacy->capture_time_us == 0 && !legacy->discontinuity,
             "frame without capture time was not preserved");
     Require(SendVideoFeedback(sockets[1], {true, 500000, 15}),
             "feedback send failed");

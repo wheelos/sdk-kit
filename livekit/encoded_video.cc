@@ -102,6 +102,7 @@ void EncodedIngress::ResetStreamLocked(std::uint32_t camera_index) {
   auto &stream = streams_[camera_index];
   stream.pending.clear();
   stream.waiting_keyframe = true;
+  stream.discontinuity = true;
   feedback_.keyframe_requested = true;
 }
 
@@ -110,11 +111,26 @@ void EncodedIngress::ResetLocked() {
     ResetStreamLocked(i);
 }
 
+void EncodedIngress::ApplyDropsLocked() {
+  if (dropped_.exchange(false)) {
+    for (auto &stream_dropped : dropped_streams_)
+      stream_dropped.store(false);
+    ResetLocked();
+    return;
+  }
+  for (std::uint32_t i = 0; i < kMaxCameraStreams; ++i) {
+    if (dropped_streams_[i].exchange(false))
+      ResetStreamLocked(i);
+  }
+}
+
 void EncodedIngress::Activate(bool active) {
   std::lock_guard<std::mutex> lock(mutex_);
   if (active_ != active) {
     feedback_ = {};
     dropped_ = false;
+    for (auto &stream_dropped : dropped_streams_)
+      stream_dropped.store(false);
     ResetLocked();
     for (auto &stream : streams_)
       stream.last_timestamp = 0;
@@ -131,8 +147,7 @@ FrameResult EncodedIngress::Submit(EncodedFrame frame, SteadyTime now) {
     dropped_ = true;
     return FrameResult::BUSY;
   }
-  if (dropped_.exchange(false))
-    ResetLocked();
+  ApplyDropsLocked();
   if (!active_)
     return FrameResult::INACTIVE;
   if (!ValidEncodedFrame(frame)) {
@@ -152,14 +167,15 @@ FrameResult EncodedIngress::Submit(EncodedFrame frame, SteadyTime now) {
   if (stream.waiting_keyframe && !frame.keyframe)
     return FrameResult::WAITING_KEYFRAME;
   stream.waiting_keyframe = false;
+  frame.discontinuity |= stream.discontinuity;
+  stream.discontinuity = false;
   stream.pending.push_back({std::move(frame), now});
   return FrameResult::ACCEPTED;
 }
 
 std::optional<EncodedFrame> EncodedIngress::Take(SteadyTime now) {
   std::lock_guard<std::mutex> lock(mutex_);
-  if (dropped_.exchange(false))
-    ResetLocked();
+  ApplyDropsLocked();
   for (std::uint32_t i = 0; i < kMaxCameraStreams; ++i) {
     if (!streams_[i].pending.empty() &&
         now - streams_[i].pending.front().received > kMaxEncodedAge)
@@ -193,14 +209,21 @@ VideoFeedback EncodedIngress::TakeFeedback() {
   std::lock_guard<std::mutex> lock(mutex_);
   if (!active_)
     return {};
-  if (dropped_.exchange(false))
-    ResetLocked();
+  ApplyDropsLocked();
   const auto result = feedback_;
   feedback_ = {};
   return result;
 }
 
 void EncodedIngress::Discontinuity() { dropped_ = true; }
+
+void EncodedIngress::Discontinuity(std::uint32_t camera_index) {
+  if (camera_index >= kMaxCameraStreams) {
+    dropped_ = true;
+    return;
+  }
+  dropped_streams_[camera_index] = true;
+}
 
 bool SendEncodedFrame(int fd, const EncodedFrame &frame) {
   if (!ValidEncodedFrame(frame) || frame.sequence == 0)
@@ -213,6 +236,8 @@ bool SendEncodedFrame(int fd, const EncodedFrame &frame) {
   if (frame.capture_time_us > 0)
     header["capture_time_us"] = Json::Int64(frame.capture_time_us);
   header["keyframe"] = frame.keyframe;
+  if (frame.discontinuity)
+    header["discontinuity"] = true;
   header["sequence"] = Json::UInt64(frame.sequence);
   header["camera_index"] = frame.camera_index;
   header["sent_at_ns"] =
@@ -249,6 +274,8 @@ std::optional<EncodedFrame> ReceiveEncodedFrame(int fd) {
       (header.isMember("capture_time_us") &&
        (!header["capture_time_us"].isInt64() ||
         header["capture_time_us"].asInt64() <= 0)) ||
+      (header.isMember("discontinuity") &&
+       !header["discontinuity"].isBool()) ||
       (header.isMember("camera_index") && !header["camera_index"].isUInt()))
     throw std::runtime_error("invalid encoded metadata");
   const auto sent =
@@ -263,6 +290,8 @@ std::optional<EncodedFrame> ReceiveEncodedFrame(int fd) {
   if (header.isMember("capture_time_us"))
     frame.capture_time_us = header["capture_time_us"].asInt64();
   frame.keyframe = header["keyframe"].asBool();
+  frame.discontinuity =
+      header.isMember("discontinuity") && header["discontinuity"].asBool();
   frame.sequence = header["sequence"].asUInt64();
   frame.camera_index =
       header.isMember("camera_index") ? header["camera_index"].asUInt() : 0u;
