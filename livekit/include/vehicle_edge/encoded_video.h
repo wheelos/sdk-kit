@@ -37,7 +37,10 @@ struct EncodedFrame {
   std::uint32_t width = 0;
   std::uint32_t height = 0;
   std::int64_t timestamp_us = 0;
+  // Unix microseconds at appsink read; zero means unavailable.
+  std::int64_t capture_time_us = 0;
   bool keyframe = false;
+  bool discontinuity = false;
   std::uint64_t sequence = 0;
   std::uint32_t camera_index = 0;
 };
@@ -61,6 +64,7 @@ public:
   void Feedback(const VideoFeedback &feedback);
   VideoFeedback TakeFeedback();
   void Discontinuity();
+  void Discontinuity(std::uint32_t camera_index);
 
 private:
   struct Pending {
@@ -69,13 +73,16 @@ private:
   };
   struct StreamState {
     bool waiting_keyframe = true;
+    bool discontinuity = true;
     std::int64_t last_timestamp = 0;
     std::deque<Pending> pending;
   };
   void ResetLocked();
   void ResetStreamLocked(std::uint32_t camera_index);
+  void ApplyDropsLocked();
   std::mutex mutex_;
   std::atomic<bool> dropped_{false};
+  std::array<std::atomic<bool>, kMaxCameraStreams> dropped_streams_{};
   bool active_ = false;
   std::size_t next_camera_ = 0;
   std::array<StreamState, kMaxCameraStreams> streams_{};

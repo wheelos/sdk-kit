@@ -152,9 +152,18 @@ std::optional<std::string> EncodeRTCState(const Json::Value &snapshot,
   packet["sources"] = sources;
   auto encoded = EncodeJSON(packet);
   if (encoded.size() > 12000) {
-    packet["sources"] = Json::Value();
+    Json::Value minimal_sources(Json::objectValue);
+    if (sources.isObject() && sources.isMember("vehicle_status")) {
+      minimal_sources["vehicle_status"] = sources["vehicle_status"];
+    }
+    packet["sources"] =
+        minimal_sources.empty() ? Json::Value() : minimal_sources;
     packet["sources_omitted"] = true;
     encoded = EncodeJSON(packet);
+    if (encoded.size() > 12000 && !minimal_sources.empty()) {
+      packet["sources"] = Json::Value();
+      encoded = EncodeJSON(packet);
+    }
   }
   if (encoded.size() > 12000)
     return std::nullopt;
@@ -369,8 +378,22 @@ int vehicle_edge::RunMediaBackend(const MediaWorkerConfig &config) {
       } else {
         source = std::make_shared<livekit::VideoSource>(640, 480);
       }
-      auto track = participant->publishVideoTrack(
-          name, source, livekit::TrackSource::SOURCE_CAMERA);
+      std::shared_ptr<livekit::LocalVideoTrack> track;
+      if (encoded) {
+        track = livekit::LocalVideoTrack::createLocalVideoTrack(name, source);
+        livekit::TrackPublishOptions publish_options;
+        publish_options.source = livekit::TrackSource::SOURCE_CAMERA;
+        publish_options.video_encoder =
+            livekit::VideoEncoderBackend::PreEncoded;
+        publish_options.video_codec = livekit::VideoCodec::H264;
+        publish_options.simulcast = false;
+        publish_options.frame_metadata_features.emplace();
+        publish_options.frame_metadata_features->user_timestamp = true;
+        participant->publishTrack(track, publish_options);
+      } else {
+        track = participant->publishVideoTrack(
+            name, source, livekit::TrackSource::SOURCE_CAMERA);
+      }
       if (!track)
         throw std::runtime_error("RTC video publication failed");
       sources.push_back(std::move(source));
@@ -392,7 +415,9 @@ int vehicle_edge::RunMediaBackend(const MediaWorkerConfig &config) {
     std::array<std::int64_t, vehicle_edge::kMaxCameraStreams> last_pts{0, 0, 0};
     std::array<std::int64_t, vehicle_edge::kMaxCameraStreams> base_pts{0, 0, 0};
     std::array<std::int64_t, vehicle_edge::kMaxCameraStreams> base_time{0, 0, 0};
-    std::uint64_t last_sequence = 0;
+    std::array<std::int64_t, vehicle_edge::kMaxCameraStreams> last_output_time{
+        0, 0, 0};
+    std::string last_control_feedback;
     vehicle_edge::VideoFeedback feedback;
     feedback.keyframe_requested = publish_video && encoded;
     while (Authorized(update)) {
@@ -405,11 +430,12 @@ int vehicle_edge::RunMediaBackend(const MediaWorkerConfig &config) {
       if (control.failed)
         throw std::runtime_error("control IPC unavailable");
       if (control.enabled && update.control_feedback.isObject()) {
-        if (now >= next_control) {
-          const auto body = EncodeJSON(update.control_feedback);
+        const auto body = EncodeJSON(update.control_feedback);
+        if (now >= next_control || body != last_control_feedback) {
           participant->publishData(
               std::vector<std::uint8_t>(body.begin(), body.end()), true, {},
               "vehicle.control.feedback.v2");
+          last_control_feedback = body;
           next_control = now + std::chrono::milliseconds(50);
         }
       }
@@ -437,37 +463,51 @@ int vehicle_edge::RunMediaBackend(const MediaWorkerConfig &config) {
             continue;
           }
           const auto cam = frame->camera_index;
-          if (frame->sequence != last_sequence + 1)
-            waiting_keyframe.fill(true);
-          last_sequence = frame->sequence;
-          if (frame->timestamp_us <= last_pts[cam])
-            throw std::runtime_error("nonmonotonic encoded timestamp");
+          if (frame->discontinuity || frame->timestamp_us <= last_pts[cam]) {
+            waiting_keyframe[cam] = true;
+            base_pts[cam] = 0;
+            feedback.keyframe_requested = true;
+            if (frame->timestamp_us <= last_pts[cam]) {
+              last_pts[cam] = frame->timestamp_us;
+              continue;
+            }
+          }
           last_pts[cam] = frame->timestamp_us;
           if (waiting_keyframe[cam] && !frame->keyframe) {
             feedback.keyframe_requested = true;
             continue;
           }
+          const bool resync_base = waiting_keyframe[cam];
           waiting_keyframe[cam] = false;
-          if (!base_pts[cam]) {
-            base_pts[cam] = frame->timestamp_us;
-            base_time[cam] =
-                std::chrono::duration_cast<std::chrono::microseconds>(
-                    now.time_since_epoch())
-                    .count();
-          }
-          const auto elapsed_us = frame->timestamp_us - base_pts[cam];
           const auto clock_us =
               std::chrono::duration_cast<std::chrono::microseconds>(
                   now.time_since_epoch())
                   .count();
+          if (!base_pts[cam] || resync_base) {
+            base_pts[cam] = frame->timestamp_us;
+            base_time[cam] = std::max(clock_us, last_output_time[cam] + 1);
+          }
+          const auto elapsed_us = frame->timestamp_us - base_pts[cam];
           if (elapsed_us > clock_us - base_time[cam] + 250000 ||
-              clock_us - base_time[cam] - elapsed_us > 250000)
-            throw std::runtime_error("encoded PTS outside freshness window");
+              clock_us - base_time[cam] - elapsed_us > 250000) {
+            // Self-heal single-camera PTS drift or >250ms hardware stall without
+            // tearing down sibling cameras or the DataChannel control worker.
+            waiting_keyframe[cam] = true;
+            base_pts[cam] = 0;
+            feedback.keyframe_requested = true;
+            continue;
+          }
           livekit::EncodedVideoSource::Frame input_frame;
           input_frame.is_keyframe = frame->keyframe;
           input_frame.width = frame->width;
           input_frame.height = frame->height;
           input_frame.timestamp_us = base_time[cam] + elapsed_us;
+          last_output_time[cam] = input_frame.timestamp_us;
+          if (frame->capture_time_us > 0) {
+            input_frame.metadata.emplace();
+            input_frame.metadata->user_timestamp_us =
+                static_cast<std::uint64_t>(frame->capture_time_us);
+          }
           input_frame.data = std::move(frame->data);
           if (!encoded_sources[cam]->captureFrame(input_frame)) {
             waiting_keyframe[cam] = true;
