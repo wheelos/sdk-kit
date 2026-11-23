@@ -44,21 +44,25 @@ void Queue() {
           "session began with undecodable delta");
   Require(queue.Submit(Frame(2), now) == FrameResult::ACCEPTED, "IDR rejected");
   Require(queue.Submit(Frame(3, false), now) == FrameResult::ACCEPTED,
-          "delta rejected");
-  Require(queue.Submit(Frame(4, false), now) == FrameResult::WAITING_KEYFRAME,
+          "delta 3 rejected");
+  Require(queue.Submit(Frame(4, false), now) == FrameResult::ACCEPTED,
+          "delta 4 rejected");
+  Require(queue.Submit(Frame(5, false), now) == FrameResult::ACCEPTED,
+          "delta 5 rejected");
+  Require(queue.Submit(Frame(6, false), now) == FrameResult::WAITING_KEYFRAME,
           "overflow did not reset reference chain");
   Require(!queue.Take(now), "overflow retained obsolete frame");
   Require(queue.TakeFeedback().keyframe_requested,
           "overflow did not request IDR");
-  Require(queue.Submit(Frame(5), now) == FrameResult::ACCEPTED,
+  Require(queue.Submit(Frame(7), now) == FrameResult::ACCEPTED,
           "fresh IDR failed to recover");
   Require(!queue.Take(now + 251ms), "stale AU survived");
-  Require(queue.Submit(Frame(6, false), now + 251ms) ==
+  Require(queue.Submit(Frame(8, false), now + 251ms) ==
               FrameResult::WAITING_KEYFRAME,
           "stale drop did not invalidate chain");
-  Require(queue.Submit(Frame(7), now + 251ms) == FrameResult::ACCEPTED,
+  Require(queue.Submit(Frame(9), now + 251ms) == FrameResult::ACCEPTED,
           "stale recovery failed");
-  Require(queue.Submit(Frame(7, false), now + 251ms) == FrameResult::INVALID,
+  Require(queue.Submit(Frame(9, false), now + 251ms) == FrameResult::INVALID,
           "duplicate PTS accepted");
   queue.Activate(false);
   queue.Activate(true);
@@ -128,8 +132,9 @@ void Queue() {
   }
   Require(saw_cam2_discontinuity_idr,
           "recovery IDR did not carry discontinuity flag to worker");
-  Require(queue.TakeFeedback().keyframe_requested,
-          "single-camera discontinuity did not request keyframe");
+  const auto cam2_fb = queue.TakeFeedback();
+  Require(cam2_fb.keyframe_requested && cam2_fb.camera_mask == (1u << 2),
+          "single-camera discontinuity leaked keyframe request to siblings");
 }
 
 void Validation() {
@@ -176,6 +181,12 @@ void IPC() {
                 received->camera_index == 2 &&
                 received->capture_time_us == frame.capture_time_us,
             "IPC metadata or payload corrupted");
+    Require(SendVideoFeedback(sockets[0], {true, 750000, 30, 0b101}),
+            "video feedback send failed");
+    const auto fb = ReceiveVideoFeedback(sockets[1]);
+    Require(fb && fb->keyframe_requested && fb->target_bitrate_bps == 750000 &&
+                fb->camera_mask == 0b101,
+            "video feedback camera_mask corrupted");
     frame.capture_time_us = 0;
     frame.discontinuity = false;
     Require(SendEncodedFrame(sockets[0], frame), "legacy frame send failed");

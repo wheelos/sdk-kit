@@ -440,12 +440,19 @@ int vehicle_edge::RunMediaBackend(const MediaWorkerConfig &config) {
         }
       }
       if (publish_video && encoded) {
-        for (const auto &encoded_source : encoded_sources) {
-          const auto requested = encoded_source->takeFeedback();
-          feedback.keyframe_requested |= requested.keyframe_requested;
-          if (requested.rate_control) {
+        for (std::size_t cam = 0; cam < encoded_sources.size(); ++cam) {
+          const auto requested = encoded_sources[cam]->takeFeedback();
+          if (requested.keyframe_requested) {
+            feedback.keyframe_requested = true;
+            feedback.camera_mask |= (1u << cam);
+          }
+          if (requested.rate_control &&
+              requested.rate_control->target_bitrate_bps > 0) {
+            const auto bps = requested.rate_control->target_bitrate_bps;
             feedback.target_bitrate_bps =
-                requested.rate_control->target_bitrate_bps;
+                feedback.target_bitrate_bps == 0
+                    ? bps
+                    : std::min(feedback.target_bitrate_bps, bps);
             feedback.framerate_fps = requested.rate_control->framerate_fps;
           }
         }
@@ -454,7 +461,10 @@ int vehicle_edge::RunMediaBackend(const MediaWorkerConfig &config) {
             feedback = {};
         }
         // Bound work per supervisor iteration, even if a producer floods IPC.
-        for (int count = 0; count < 6 && Authorized(update); ++count) {
+        for (int count = 0;
+             count < static_cast<int>(vehicle_edge::kMaxCameraStreams * 4) &&
+             Authorized(update);
+             ++count) {
           auto frame = vehicle_edge::ReceiveEncodedFrame(4);
           if (!frame)
             break;
@@ -463,11 +473,20 @@ int vehicle_edge::RunMediaBackend(const MediaWorkerConfig &config) {
             continue;
           }
           const auto cam = frame->camera_index;
-          if (frame->discontinuity || frame->timestamp_us <= last_pts[cam]) {
+          if (frame->timestamp_us <= last_pts[cam]) {
             waiting_keyframe[cam] = true;
             base_pts[cam] = 0;
             feedback.keyframe_requested = true;
-            if (frame->timestamp_us <= last_pts[cam]) {
+            feedback.camera_mask |= (1u << cam);
+            last_pts[cam] = frame->timestamp_us;
+            continue;
+          }
+          if (frame->discontinuity) {
+            waiting_keyframe[cam] = true;
+            base_pts[cam] = 0;
+            if (!frame->keyframe) {
+              feedback.keyframe_requested = true;
+              feedback.camera_mask |= (1u << cam);
               last_pts[cam] = frame->timestamp_us;
               continue;
             }
@@ -475,9 +494,10 @@ int vehicle_edge::RunMediaBackend(const MediaWorkerConfig &config) {
           last_pts[cam] = frame->timestamp_us;
           if (waiting_keyframe[cam] && !frame->keyframe) {
             feedback.keyframe_requested = true;
+            feedback.camera_mask |= (1u << cam);
             continue;
           }
-          const bool resync_base = waiting_keyframe[cam];
+          bool resync_base = waiting_keyframe[cam];
           waiting_keyframe[cam] = false;
           const auto clock_us =
               std::chrono::duration_cast<std::chrono::microseconds>(
@@ -487,15 +507,22 @@ int vehicle_edge::RunMediaBackend(const MediaWorkerConfig &config) {
             base_pts[cam] = frame->timestamp_us;
             base_time[cam] = std::max(clock_us, last_output_time[cam] + 1);
           }
-          const auto elapsed_us = frame->timestamp_us - base_pts[cam];
-          if (elapsed_us > clock_us - base_time[cam] + 250000 ||
-              clock_us - base_time[cam] - elapsed_us > 250000) {
-            // Self-heal single-camera PTS drift or >250ms hardware stall without
+          auto elapsed_us = frame->timestamp_us - base_pts[cam];
+          if (elapsed_us > clock_us - base_time[cam] + 500000 ||
+              clock_us - base_time[cam] - elapsed_us > 500000) {
+            // Self-heal single-camera PTS drift or >500ms hardware stall without
             // tearing down sibling cameras or the DataChannel control worker.
-            waiting_keyframe[cam] = true;
-            base_pts[cam] = 0;
-            feedback.keyframe_requested = true;
-            continue;
+            if (frame->keyframe) {
+              base_pts[cam] = frame->timestamp_us;
+              base_time[cam] = std::max(clock_us, last_output_time[cam] + 1);
+              elapsed_us = 0;
+            } else {
+              waiting_keyframe[cam] = true;
+              base_pts[cam] = 0;
+              feedback.keyframe_requested = true;
+              feedback.camera_mask |= (1u << cam);
+              continue;
+            }
           }
           livekit::EncodedVideoSource::Frame input_frame;
           input_frame.is_keyframe = frame->keyframe;
@@ -512,6 +539,7 @@ int vehicle_edge::RunMediaBackend(const MediaWorkerConfig &config) {
           if (!encoded_sources[cam]->captureFrame(input_frame)) {
             waiting_keyframe[cam] = true;
             feedback.keyframe_requested = true;
+            feedback.camera_mask |= (1u << cam);
           }
         }
       } else if (publish_video && now >= next_frame) {
