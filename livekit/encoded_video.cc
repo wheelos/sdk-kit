@@ -55,14 +55,19 @@ bool SendPacket(int fd, const void *data, std::size_t size) {
 
 template <std::size_t N>
 std::optional<std::vector<std::uint8_t>> ReceivePacket(int fd) {
-  std::array<std::uint8_t, N> data{};
+  std::uint8_t peek = 0;
+  const auto peeked =
+      recv(fd, &peek, 1, MSG_PEEK | MSG_TRUNC | MSG_DONTWAIT);
+  if (peeked < 0 && (errno == EAGAIN || errno == EWOULDBLOCK))
+    return {};
+  if (peeked <= 0 || static_cast<std::size_t>(peeked) > N)
+    throw std::runtime_error("encoded video IPC closed or oversized");
+  std::vector<std::uint8_t> data(static_cast<std::size_t>(peeked));
   const auto size =
       recv(fd, data.data(), data.size(), MSG_DONTWAIT | MSG_TRUNC);
-  if (size < 0 && (errno == EAGAIN || errno == EWOULDBLOCK))
-    return {};
-  if (size <= 0 || static_cast<std::size_t>(size) > data.size())
-    throw std::runtime_error("encoded video IPC closed or oversized");
-  return std::vector<std::uint8_t>(data.begin(), data.begin() + size);
+  if (size != peeked)
+    throw std::runtime_error("encoded video IPC read mismatch");
+  return data;
 }
 
 } // namespace
@@ -104,6 +109,7 @@ void EncodedIngress::ResetStreamLocked(std::uint32_t camera_index) {
   stream.waiting_keyframe = true;
   stream.discontinuity = true;
   feedback_.keyframe_requested = true;
+  feedback_.camera_mask |= (1u << camera_index);
 }
 
 void EncodedIngress::ResetLocked() {
@@ -142,16 +148,15 @@ void EncodedIngress::Activate(bool active) {
 }
 
 FrameResult EncodedIngress::Submit(EncodedFrame frame, SteadyTime now) {
-  std::unique_lock<std::mutex> lock(mutex_, std::try_to_lock);
-  if (!lock.owns_lock()) {
-    dropped_ = true;
-    return FrameResult::BUSY;
-  }
+  std::lock_guard<std::mutex> lock(mutex_);
   ApplyDropsLocked();
   if (!active_)
     return FrameResult::INACTIVE;
   if (!ValidEncodedFrame(frame)) {
-    ResetLocked();
+    if (frame.camera_index < kMaxCameraStreams)
+      ResetStreamLocked(frame.camera_index);
+    else
+      ResetLocked();
     return FrameResult::INVALID;
   }
   auto &stream = streams_[frame.camera_index];
@@ -160,7 +165,7 @@ FrameResult EncodedIngress::Submit(EncodedFrame frame, SteadyTime now) {
     return FrameResult::INVALID;
   }
   stream.last_timestamp = frame.timestamp_us;
-  if (stream.pending.size() == 2 ||
+  if (stream.pending.size() >= 4 ||
       (!stream.pending.empty() &&
        now - stream.pending.front().received > kMaxEncodedAge))
     ResetStreamLocked(frame.camera_index);
@@ -198,7 +203,12 @@ void EncodedIngress::Feedback(const VideoFeedback &feedback) {
   std::lock_guard<std::mutex> lock(mutex_);
   if (!active_)
     return;
-  feedback_.keyframe_requested |= feedback.keyframe_requested;
+  if (feedback.keyframe_requested) {
+    feedback_.keyframe_requested = true;
+    feedback_.camera_mask |=
+        feedback.camera_mask ? feedback.camera_mask
+                             : ((1u << kMaxCameraStreams) - 1u);
+  }
   if (feedback.target_bitrate_bps) {
     feedback_.target_bitrate_bps = feedback.target_bitrate_bps;
     feedback_.framerate_fps = feedback.framerate_fps;
@@ -307,6 +317,8 @@ bool SendVideoFeedback(int fd, const VideoFeedback &feedback) {
   value["keyframe_requested"] = feedback.keyframe_requested;
   value["target_bitrate_bps"] = Json::UInt64(feedback.target_bitrate_bps);
   value["framerate_fps"] = feedback.framerate_fps;
+  if (feedback.camera_mask != 0)
+    value["camera_mask"] = Json::UInt(feedback.camera_mask);
   const auto body = EncodeJSON(value);
   return SendPacket(fd, body.data(), body.size());
 }
@@ -318,13 +330,17 @@ std::optional<VideoFeedback> ReceiveVideoFeedback(int fd) {
   const auto value = ParseHTTPJSON(std::string(packet->begin(), packet->end()));
   if (value["version"] != 1 || !value["keyframe_requested"].isBool() ||
       !value["target_bitrate_bps"].isUInt64() ||
-      !value["framerate_fps"].isNumeric())
+      !value["framerate_fps"].isNumeric() ||
+      (value.isMember("camera_mask") && !value["camera_mask"].isUInt()))
     throw std::runtime_error("invalid video feedback");
   const double fps = value["framerate_fps"].asDouble();
   if (!std::isfinite(fps) || fps < 0 || fps > 240)
     throw std::runtime_error("invalid feedback frame rate");
-  return VideoFeedback{value["keyframe_requested"].asBool(),
-                       value["target_bitrate_bps"].asUInt64(), fps};
+  VideoFeedback feedback{value["keyframe_requested"].asBool(),
+                         value["target_bitrate_bps"].asUInt64(), fps};
+  if (value.isMember("camera_mask"))
+    feedback.camera_mask = value["camera_mask"].asUInt();
+  return feedback;
 }
 
 } // namespace vehicle_edge

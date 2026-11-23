@@ -28,7 +28,7 @@ namespace vehicle_edge {
 
 using SteadyTime = std::chrono::steady_clock::time_point;
 
-constexpr std::size_t kMaxEncodedBytes = 128 * 1024;
+constexpr std::size_t kMaxEncodedBytes = 512 * 1024;
 constexpr auto kMaxEncodedAge = std::chrono::milliseconds(250);
 constexpr std::uint32_t kMaxCameraStreams = 3;
 
@@ -49,6 +49,9 @@ struct VideoFeedback {
   bool keyframe_requested = false;
   std::uint64_t target_bitrate_bps = 0;
   double framerate_fps = 0;
+  // Bitmask of camera indices (bit i => camera i). Zero with keyframe_requested
+  // preserves legacy broadcast behavior (request keyframe on all cameras).
+  std::uint32_t camera_mask = 0;
 };
 
 enum class FrameResult { ACCEPTED, INACTIVE, BUSY, INVALID, WAITING_KEYFRAME };
