@@ -67,6 +67,8 @@ const std::unordered_set<std::string> &KnownConfigFields() {
       "camera_capture_config",
       "control_mode",
       "control_channel",
+      "control_longitudinal_mode",
+      "max_remote_speed_mps",
       "camera_track",
       "camera_layout",
       "mission_runtime_channel",

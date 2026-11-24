@@ -581,8 +581,10 @@ void InstallLostResponsesAndRecovery() {
     Require(f.Tick(b).status == e::Status::Waiting,
             "lost ack reported success");
     auto device = f.storage.Read(f.directory + "/device.json");
-    Require(device == e::DefaultRuntimeConfiguration(f.CredentialReference()) &&
-                device.size() == 24,
+    Require(device == e::DefaultRuntimeConfiguration(
+                          f.CredentialReference(),
+                          e::ParseBootstrapConfig(f.config)) &&
+                device.size() == 26,
             "validated install did not create complete separated defaults");
     auto auth = f.storage.Read(f.directory + "/credentials.json");
     Require(auth == staged && !f.State().isMember("pending_credentials"),
@@ -1038,10 +1040,14 @@ void AutomaticDirectoriesAndSeparatedConfiguration() {
     for (const auto& name : original_runtime.getMemberNames())
       Require(runtime[name] == original_runtime[name],
               "default backfill changed an existing field");
-    Require(runtime.size() == 24 &&
+    Require(runtime.size() == 26 &&
                 runtime["vehicle_status_channel"] ==
                     "/apollo/guardian/vehicle_status" &&
                 runtime["task_mode"] == "disabled" &&
+                runtime["camera_layout"] == "single" &&
+                runtime["camera_source"].isNull() &&
+                runtime["control_longitudinal_mode"] == "throttle" &&
+                runtime["max_remote_speed_mps"].asDouble() == 5.0 &&
                 runtime["data_store_path"] ==
                     "/var/lib/teleop/data/data.sqlite3",
             "existing runtime did not receive missing defaults");
@@ -1079,16 +1085,70 @@ void AutomaticDirectoriesAndSeparatedConfiguration() {
   Reject([&] { vehicle_edge::ResolveDeviceConfig(runtime, credentials); });
 }
 
+void RuntimeMediaDefaults() {
+  Fixture f;
+  const auto credentials = f.CredentialReference();
+  const auto local_config = e::ParseBootstrapConfig(f.config);
+  const auto defaults =
+      e::DefaultRuntimeConfiguration(credentials, local_config);
+  Require(defaults["media_enabled"].asBool() &&
+              defaults["camera_layout"] == "three" &&
+              defaults["camera_source"] == "h264_annexb" &&
+              defaults["control_mode"] == "disabled" &&
+              defaults["control_longitudinal_mode"] == "speed" &&
+              defaults["max_remote_speed_mps"].asDouble() == 5.0 &&
+              defaults["livekit_url"] == "ws://127.0.0.1:9999" &&
+              defaults["media_worker_path"] ==
+                  "/apollo/bazel-bin/external/wheelos_sdk_kit~/livekit/"
+                  "vehicle_media_worker",
+          "new enrollment did not generate the media and speed defaults");
+
+  auto bootstrap_config = f.config;
+  bootstrap_config.removeMember("allow_insecure_localhost");
+  bootstrap_config["gateway_url"] = "https://gateway.example.com";
+  const auto production_config = e::ParseBootstrapConfig(bootstrap_config);
+  const auto production_defaults =
+      e::DefaultRuntimeConfiguration(credentials, production_config);
+  Require(production_defaults["livekit_url"] == "wss://gateway.example.com",
+          "HTTPS gateway did not supply a secure default endpoint");
+
+  bootstrap_config["livekit_url"] = "wss://rtc.example.com";
+  bootstrap_config["media_worker_path"] = "/opt/teleop/bin/vehicle_media_worker";
+  const auto override_config = e::ParseBootstrapConfig(bootstrap_config);
+  const auto customized =
+      e::DefaultRuntimeConfiguration(credentials, override_config);
+  Require(customized["livekit_url"] == bootstrap_config["livekit_url"] &&
+              customized["media_worker_path"] ==
+                  bootstrap_config["media_worker_path"],
+          "explicit media deployment paths did not override defaults");
+
+  Json::Value existing(Json::objectValue);
+  existing["credentials_file"] = credentials;
+  const auto backfilled =
+      e::MergeRuntimeDefaults(existing, credentials, override_config);
+  Require(!backfilled["media_enabled"].asBool() &&
+              backfilled["camera_layout"] == "single" &&
+              backfilled["camera_source"].isNull() &&
+              backfilled["livekit_url"].isNull() &&
+              backfilled["media_worker_path"].isNull() &&
+              backfilled["control_longitudinal_mode"] == "throttle" &&
+              backfilled["max_remote_speed_mps"].asDouble() == 5.0,
+          "default backfill changed the behavior of a legacy runtime");
+}
+
 void RuntimeDataDirectoryPreparation() {
   Fixture f;
-  const auto defaults = e::DefaultRuntimeConfiguration(f.CredentialReference());
+  const auto credentials = f.CredentialReference();
+  const auto config = e::ParseBootstrapConfig(f.config);
+  const auto defaults = e::DefaultRuntimeConfiguration(credentials, config);
   Require(defaults["data_store_path"] == "/var/lib/teleop/data/data.sqlite3" &&
-              e::MergeRuntimeDefaults(Json::Value(), f.CredentialReference()) ==
+              e::MergeRuntimeDefaults(Json::Value(), credentials, config) ==
                   defaults,
           "new enrollment did not default to durable storage");
   Json::Value minimal(Json::objectValue);
-  minimal["credentials_file"] = f.CredentialReference();
-  Require(e::MergeRuntimeDefaults(minimal, f.CredentialReference()) == defaults,
+  minimal["credentials_file"] = credentials;
+  const auto backfilled = e::MergeRuntimeDefaults(minimal, credentials, config);
+  Require(backfilled["data_store_path"] == defaults["data_store_path"],
           "missing data store was not backfilled");
   const auto root = std::filesystem::absolute(f.directory);
   const auto state = (root / "bootstrap").string();
@@ -1096,13 +1156,13 @@ void RuntimeDataDirectoryPreparation() {
   const auto directory = root / "data";
   auto runtime = minimal;
   runtime["data_store_path"] = Json::Value();
-  runtime = e::MergeRuntimeDefaults(runtime, f.CredentialReference());
+  runtime = e::MergeRuntimeDefaults(runtime, credentials, config);
   Require(runtime["data_store_path"].isNull() &&
               !e::PrepareRuntimeDataDirectory(runtime, state, f.storage) &&
               !std::filesystem::exists(directory),
           "explicit null enabled storage");
   runtime["data_store_path"] = database;
-  runtime = e::MergeRuntimeDefaults(runtime, f.CredentialReference());
+  runtime = e::MergeRuntimeDefaults(runtime, credentials, config);
   Require(runtime["data_store_path"] == database &&
               e::PrepareRuntimeDataDirectory(runtime, state, f.storage),
           "custom data directory was not prepared");
@@ -1196,16 +1256,18 @@ void CameraConfigurationPreparation() {
   })");
   Require(e::DefaultCameraCaptureConfiguration() == expected,
           "camera defaults differ from the deployment profile");
-  auto runtime = e::DefaultRuntimeConfiguration(f.CredentialReference());
+  const auto credentials = f.CredentialReference();
+  const auto config = e::ParseBootstrapConfig(f.config);
+  auto runtime = e::DefaultRuntimeConfiguration(credentials, config);
   Require(runtime["camera_capture_config"] == "/etc/teleop/cameras.json" &&
-              !runtime["media_enabled"].asBool(),
-          "runtime defaults did not prepare inactive camera configuration");
+              runtime["media_enabled"].asBool(),
+          "runtime defaults did not prepare enabled camera configuration");
   runtime["camera_capture_config"] = Json::Value();
-  Require(e::MergeRuntimeDefaults(runtime, f.CredentialReference()) == runtime &&
+  Require(e::MergeRuntimeDefaults(runtime, credentials, config) == runtime &&
               !e::PrepareCameraCaptureConfiguration(runtime, f.storage),
           "explicit null was changed or created a camera file");
   runtime.removeMember("camera_capture_config");
-  Require(e::MergeRuntimeDefaults(runtime, f.CredentialReference())
+  Require(e::MergeRuntimeDefaults(runtime, credentials, config)
                   ["camera_capture_config"] == "/etc/teleop/cameras.json",
           "missing camera path did not receive default");
   const auto root = std::filesystem::absolute(f.directory);
@@ -1419,7 +1481,7 @@ void ManagedRuntimePathSeparation() {
   config["gateway_url"] = "https://gateway.example.com";
   config = e::ParseBootstrapConfig(config);
   auto runtime = e::DefaultRuntimeConfiguration(
-      config["credentials_config"].asString());
+      config["credentials_config"].asString(), config);
   const auto valid = runtime;
   e::ValidateRuntimeLayout(config, runtime, "/etc/teleop/bootstrap.json");
   runtime["camera_capture_config"] = "/var/lib/teleop/bootstrap/key.json";
@@ -1554,8 +1616,9 @@ void BootstrapDefaultsAndCrashAfterCredentials() {
   Require(
       f.Tick(bootstrap).status == e::Status::Ready &&
           f.storage.Read(f.directory + "/device.json") ==
-              e::DefaultRuntimeConfiguration(f.CredentialReference()),
-      "crash after credentials was not repaired with safe defaults");
+              e::DefaultRuntimeConfiguration(
+                  f.CredentialReference(), e::ParseBootstrapConfig(f.config)),
+      "crash after credentials did not restore enrollment defaults");
 }
 
 void RejectMixedAndFlatConfiguration() {
@@ -1614,6 +1677,7 @@ int main() {
     LocalHTTPTransport();
     SafeStorageAndMerge();
     AutomaticDirectoriesAndSeparatedConfiguration();
+    RuntimeMediaDefaults();
     RuntimeDataDirectoryPreparation();
     CameraConfigurationPreparation();
     GroupReadableRotation();

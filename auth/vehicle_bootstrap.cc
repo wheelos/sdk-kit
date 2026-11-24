@@ -176,7 +176,8 @@ int main(int argc, char** argv) {
     const auto credentials = config["credentials_config"].asString();
     const auto runtime = enrollment::MergeRuntimeDefaults(
         ReadOptional(storage, device),
-        std::filesystem::absolute(credentials).lexically_normal().string());
+        std::filesystem::absolute(credentials).lexically_normal().string(),
+        config);
     if (runtime_user)
       enrollment::ValidateRuntimeLayout(config, runtime, bootstrap_path);
     if (check) {

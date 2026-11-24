@@ -32,8 +32,11 @@ void NullableMediaConfiguration() {
   credentials["token_url"] = "https://gateway.example.com/oauth/token";
   credentials["client_id"] = "test-client";
   credentials["client_secret"] = "synthetic-test-secret";
-  auto runtime = vehicle_edge::enrollment::DefaultRuntimeConfiguration(
-      "/etc/teleop/credentials.json");
+  Json::Value runtime(Json::objectValue);
+  runtime["credentials_file"] = "/etc/teleop/credentials.json";
+  runtime["media_enabled"] = false;
+  runtime["livekit_url"] = Json::Value();
+  runtime["camera_source"] = Json::Value();
   const auto parse = [&](const Json::Value& value) {
     return vehicle_edge::ParseMediaWorkerConfig(
         vehicle_edge::ResolveDeviceConfig(value, credentials));
@@ -151,12 +154,12 @@ void LoadCameraPublicationSettings() {
   credentials["client_id"] = "test-client";
   credentials["client_secret"] = "synthetic-test-secret";
   directory.Write("credentials.json", credentials);
+  Json::Value bootstrap(Json::objectValue);
+  bootstrap["gateway_url"] = credentials["gateway_url"];
   auto runtime = vehicle_edge::enrollment::DefaultRuntimeConfiguration(
-      (directory.path / "credentials.json").string());
+      (directory.path / "credentials.json").string(),
+      vehicle_edge::enrollment::ParseBootstrapConfig(bootstrap));
   runtime["camera_capture_config"] = (directory.path / "cameras.json").string();
-  runtime["media_enabled"] = true;
-  runtime["camera_source"] = "h264_annexb";
-  runtime["livekit_url"] = "wss://rtc.example.com";
   const auto load = [&] {
     directory.Write("device.json", runtime);
     return vehicle_edge::LoadMediaWorkerConfig(
@@ -170,6 +173,10 @@ void LoadCameraPublicationSettings() {
   camera["fps"] = 24;
   directory.Write("cameras.json", camera);
   const auto loaded = load();
+  Require(loaded.media_enabled && loaded.camera_layout == "three" &&
+              loaded.camera_source == "h264_annexb" &&
+              loaded.livekit_url == "wss://gateway.example.com",
+          "worker rejected generated media settings");
   Require(loaded.video_publish && loaded.video_publish->width == 960 &&
               loaded.video_publish->height == 540 &&
               loaded.video_publish->bitrate_bps == 1200000 &&
@@ -179,8 +186,10 @@ void LoadCameraPublicationSettings() {
   directory.Write("cameras.json", camera);
   Reject(load);
   runtime["media_enabled"] = false;
+  runtime["camera_layout"] = "single";
   Require(!load().video_publish, "disabled media loaded camera settings");
   runtime["media_enabled"] = true;
+  runtime["camera_layout"] = "three";
   runtime["camera_source"] = "simulation";
   Require(!load().video_publish, "simulation loaded camera settings");
   runtime["camera_source"] = "h264_annexb";

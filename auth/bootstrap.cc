@@ -267,9 +267,10 @@ Json::Value ParseBootstrapConfig(Json::Value config) {
   if (!config.isObject())
     throw std::runtime_error("bootstrap config must be an object");
   for (const auto& name : config.getMemberNames()) {
-    if (name != "gateway_url" && name != "state_directory" && name != "device_config" &&
-        name != "credentials_config" && name != "allow_insecure_localhost" &&
-        name != "runtime_user")
+    if (name != "gateway_url" && name != "state_directory" &&
+        name != "device_config" && name != "credentials_config" &&
+        name != "allow_insecure_localhost" && name != "runtime_user" &&
+        name != "livekit_url" && name != "media_worker_path")
       throw std::runtime_error("unsupported bootstrap field; remove " + name);
   }
   if (config.isMember("runtime_user"))
@@ -292,6 +293,25 @@ Json::Value ParseBootstrapConfig(Json::Value config) {
     throw std::runtime_error("HTTPS required");
   while (url.back() == '/') url.pop_back();
   config["gateway_url"] = url;
+  if (!config.isMember("livekit_url")) {
+    const auto scheme_end = url.find(':');
+    config["livekit_url"] =
+        (scheme_end == 5 ? "wss" : "ws") + url.substr(scheme_end);
+  }
+  auto livekit_endpoint = Text(config, "livekit_url", 2048);
+  if (livekit_endpoint.compare(0, 6, "wss://") == 0)
+    livekit_endpoint.replace(0, 6, "https://");
+  else if (livekit_endpoint.compare(0, 5, "ws://") == 0)
+    livekit_endpoint.replace(0, 5, "http://");
+  else
+    throw std::runtime_error("livekit_url requires wss");
+  if (!AllowedURL(livekit_endpoint, local_test))
+    throw std::runtime_error("invalid LiveKit endpoint");
+  if (!config.isMember("media_worker_path"))
+    config["media_worker_path"] =
+        "/apollo/bazel-bin/external/wheelos_sdk_kit~/livekit/vehicle_media_worker";
+  if (Text(config, "media_worker_path", 4096).front() != '/')
+    throw std::runtime_error("media_worker_path must be absolute");
   if (!config.isMember("state_directory"))
     config["state_directory"] = "/var/lib/teleop/bootstrap";
   if (!config.isMember("device_config"))
@@ -906,7 +926,8 @@ Result Bootstrap::Advance() {
   return Wait(interval);
 }
 
-Json::Value DefaultRuntimeConfiguration(const std::string& credentials_file) {
+Json::Value DefaultRuntimeConfiguration(const std::string& credentials_file,
+                                        const Json::Value& bootstrap_config) {
   if (credentials_file.empty() ||
       !std::filesystem::path(credentials_file).is_absolute())
     throw std::runtime_error("credentials_file must be an absolute path");
@@ -917,17 +938,21 @@ Json::Value DefaultRuntimeConfiguration(const std::string& credentials_file) {
   runtime["chassis_channel"] = "/apollo/canbus/chassis";
   runtime["vehicle_status_channel"] = "/apollo/guardian/vehicle_status";
   runtime["localization_channel"] = "/apollo/localization/pose";
-  runtime["media_enabled"] = false;
+  runtime["media_enabled"] = true;
+  runtime["livekit_url"] = bootstrap_config["livekit_url"];
+  runtime["media_worker_path"] = bootstrap_config["media_worker_path"];
+  runtime["camera_source"] = "h264_annexb";
   runtime["camera_track"] = "camera0";
-  runtime["camera_layout"] = "single";
+  runtime["camera_layout"] = "three";
   runtime["camera_capture_config"] = "/etc/teleop/cameras.json";
   runtime["control_mode"] = "disabled";
   runtime["control_channel"] = "/apollo/teleop/control";
+  runtime["control_longitudinal_mode"] = "speed";
+  runtime["max_remote_speed_mps"] = 5.0;
   runtime["task_mode"] = "disabled";
   runtime["data_store_path"] = "/var/lib/teleop/data/data.sqlite3";
   for (const auto* field : {
-           "system_status_channel", "livekit_url", "media_worker_path",
-           "camera_source",
+           "system_status_channel",
            "mission_runtime_channel", "mission_result_channel",
            "mission_request_channel", "map_id", "vehicle_model",
            "software_version"})
@@ -979,22 +1004,28 @@ bool PrepareCameraCaptureConfiguration(const Json::Value& runtime,
 }
 
 Json::Value MergeRuntimeDefaults(const Json::Value& existing,
-                                const std::string& credentials_file) {
-  const auto defaults = DefaultRuntimeConfiguration(credentials_file);
+                                 const std::string& credentials_file,
+                                 const Json::Value& bootstrap_config) {
+  auto defaults = DefaultRuntimeConfiguration(credentials_file, bootstrap_config);
+  if (existing.isNull()) return defaults;
+
   Json::Value runtime = existing;
-  if (runtime.isNull())
-    runtime = Json::Value(Json::objectValue);
   if (!runtime.isObject())
     throw std::runtime_error("runtime config must be an object");
-  if (!existing.isNull()) {
-    if (runtime["credentials_file"] != credentials_file)
+  if (runtime["credentials_file"] != credentials_file)
+    throw std::runtime_error("runtime credentials file does not match bootstrap");
+  for (const auto& name : runtime.getMemberNames())
+    if (IsAuthConfigField(name))
       throw std::runtime_error(
-          "runtime credentials file does not match bootstrap");
-    for (const auto& name : runtime.getMemberNames())
-      if (IsAuthConfigField(name))
-        throw std::runtime_error(
-            "runtime must not contain inline authentication");
-  }
+          "runtime must not contain inline authentication");
+
+  // Retain the effective settings of existing files that predate these keys.
+  defaults["media_enabled"] = false;
+  defaults["livekit_url"] = Json::Value();
+  defaults["media_worker_path"] = Json::Value();
+  defaults["camera_source"] = Json::Value();
+  defaults["camera_layout"] = "single";
+  defaults["control_longitudinal_mode"] = "throttle";
   for (const auto& name : defaults.getMemberNames()) {
     if (!runtime.isMember(name)) runtime[name] = defaults[name];
   }
@@ -1099,7 +1130,7 @@ void Bootstrap::InstallConfiguration(const Json::Value& credentials) {
   const auto reference =
       std::filesystem::absolute(auth_path).lexically_normal().string();
   const auto existing = storage_.Read(path, true, 16384);
-  const auto runtime = MergeRuntimeDefaults(existing, reference);
+  const auto runtime = MergeRuntimeDefaults(existing, reference, config_);
   (void)ResolveDeviceConfig(runtime, credentials);
   if (JSON(runtime).size() + 1 > 16384)
     throw std::runtime_error("runtime device configuration exceeds 16 KiB");
@@ -1122,8 +1153,8 @@ void Bootstrap::InstallConfiguration(const Json::Value& credentials) {
     else
       storage_.Write(path, runtime);
     hooks_.notice(existing.isNull()
-                      ? "Created complete runtime defaults; media, control and "
-                        "tasks remain disabled."
+                      ? "Created runtime defaults with three-camera media and "
+                        "speed control mode configured."
                       : "Added missing runtime defaults; existing settings "
                         "are unchanged.");
   }

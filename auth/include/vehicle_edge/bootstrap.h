@@ -87,12 +87,14 @@ class Storage {
 Json::Value MergeCredentials(const Json::Value& existing,
                              const Json::Value& credentials, bool local_test);
 Json::Value ParseBootstrapConfig(Json::Value config);
-// Generated defaults enable durable storage; media, control and tasks stay off.
-Json::Value DefaultRuntimeConfiguration(const std::string& credentials_file);
+// Generate the initial runtime profile using a parsed bootstrap config.
+Json::Value DefaultRuntimeConfiguration(const std::string& credentials_file,
+                                        const Json::Value& bootstrap_config);
 Json::Value DefaultCameraCaptureConfiguration();
 // Preserve explicit values, including null, and add only missing defaults.
 Json::Value MergeRuntimeDefaults(const Json::Value& existing,
-                                const std::string& credentials_file);
+                                 const std::string& credentials_file,
+                                 const Json::Value& bootstrap_config);
 // Prepare storage for the effective runtime account, without opening SQLite.
 // Returns false when data_store_path is explicitly null.
 bool PrepareRuntimeDataDirectory(const Json::Value& runtime,

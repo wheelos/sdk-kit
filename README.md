@@ -97,15 +97,19 @@ inside `enrollment.json`, validated for exact `token_url`/`issuer` origin plus
 OAuth and Gateway `device-auth-check`, and only then committed to
 `/etc/teleop/credentials.json` (without `allow_insecure_localhost` in
 production) and complete runtime defaults in `/etc/teleop/device.json`
-(`credentials_file` reference). Optional, unconfigured runtime fields are
-explicit JSON `null`, except `data_store_path` and `camera_capture_config`,
-which default to `/var/lib/teleop/data/data.sqlite3` and
-`/etc/teleop/cameras.json`, respectively. Media, control and tasks remain disabled.
+(`credentials_file` reference). New configurations enable three-camera H.264
+media and select speed mode with a 5 m/s upper endpoint. Remote control and
+tasks start disabled. The default LiveKit URL uses the Gateway address with a
+WebSocket scheme. Set `livekit_url` for a separate media endpoint or
+`media_worker_path` for an alternate executable in `bootstrap.json`.
+The default database and camera configuration paths are
+`/var/lib/teleop/data/data.sqlite3` and `/etc/teleop/cameras.json`.
 Explicit `data_store_path: null` still disables durable storage.
 `DefaultRuntimeConfiguration` defines the generated fields. Existing files gain
-only missing keys: explicit values, including `false` and optional `null`, are
-preserved. A repeated authentication with no missing fields does not rewrite
-the runtime file. If valid credentials are already on disk after a
+only missing keys and preserve explicit values, including `false` and optional
+`null`. Backfill uses the previous media and longitudinal defaults for absent
+fields. A repeated authentication with no missing fields does not rewrite the
+runtime file. If valid credentials are already on disk after a
 lost acknowledgment, `vehicle_bootstrap` verifies `device-auth-check` and
 completes `installation-complete` idempotently without re-redeeming. There is no
 old configuration migration or inline runtime-authentication fallback. Retired
