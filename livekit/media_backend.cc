@@ -420,8 +420,12 @@ int vehicle_edge::RunMediaBackend(const MediaWorkerConfig &config) {
     std::string last_control_feedback;
     vehicle_edge::VideoFeedback feedback;
     feedback.keyframe_requested = publish_video && encoded;
+    bool was_reconnecting = false;
+    auto reconnecting_since = vehicle_edge::SteadyTime{};
+    constexpr auto kMaxWorkerReconnectWait = std::chrono::seconds(5);
     while (Authorized(update)) {
-      if (room.connectionState() != livekit::ConnectionState::Connected)
+      const auto conn_state = room.connectionState();
+      if (conn_state == livekit::ConnectionState::Disconnected)
         throw std::runtime_error("RTC disconnected");
       Drain(&update);
       if (!Authorized(update))
@@ -429,6 +433,36 @@ int vehicle_edge::RunMediaBackend(const MediaWorkerConfig &config) {
       const auto now = std::chrono::steady_clock::now();
       if (control.failed)
         throw std::runtime_error("control IPC unavailable");
+      if (conn_state == livekit::ConnectionState::Reconnecting) {
+        if (!was_reconnecting) {
+          was_reconnecting = true;
+          reconnecting_since = now;
+          for (std::size_t cam = 0; cam < waiting_keyframe.size(); ++cam) {
+            waiting_keyframe[cam] = true;
+            base_pts[cam] = 0;
+          }
+        } else if (now - reconnecting_since > kMaxWorkerReconnectWait) {
+          throw std::runtime_error("RTC reconnect timed out");
+        }
+        if (publish_video && encoded) {
+          for (int count = 0;
+               count < static_cast<int>(vehicle_edge::kMaxCameraStreams * 4) &&
+               Authorized(update);
+               ++count) {
+            if (!vehicle_edge::ReceiveEncodedFrame(4))
+              break;
+          }
+        }
+        Receive(&update, true, publish_video && encoded);
+        continue;
+      }
+      if (was_reconnecting) {
+        was_reconnecting = false;
+        if (publish_video && encoded) {
+          feedback.keyframe_requested = true;
+          feedback.camera_mask = (1u << encoded_sources.size()) - 1u;
+        }
+      }
       if (control.enabled && update.control_feedback.isObject()) {
         const auto body = EncodeJSON(update.control_feedback);
         if (now >= next_control || body != last_control_feedback) {
