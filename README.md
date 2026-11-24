@@ -174,6 +174,17 @@ physical capture requires enabled H264 media, the camera build option and a
 layout matching the file's device count. The generated runtime retains its
 existing `single` layout; select `three` to activate the three-device file.
 
+For enabled H264 camera capture, the media worker reads the same protected
+`camera_capture_config` file. It initializes each encoded video source with
+`output_width`/`output_height` and explicitly publishes with `bitrate_bps` and
+`fps` as per-track limits. This prevents LiveKit's initial-resolution defaults
+from silently limiting a 720p camera to a VGA publication budget. These are
+ceilings; congestion feedback may still lower the encoder bitrate. Each track
+logs its publication settings as `[teleop_video_publish]`. Changes take effect
+when the capture pipeline and media worker are restarted. Disabled media and
+simulation do not load the camera file. Encoded integrations with a missing or
+null capture path retain their existing publication behavior.
+
 Consumers must support nullable runtime fields before enrollment backfills the
 expanded configuration. Older minimal runtime files remain valid; loading a
 file without `data_store_path` still disables storage until enrollment backfills

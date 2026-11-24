@@ -59,6 +59,16 @@ bool ValidEndpointScheme(const std::string &url, const char *s1,
   return first || second;
 }
 
+unsigned CameraNumber(const Json::Value &root, const char *name,
+                      unsigned fallback, unsigned minimum, unsigned maximum) {
+  if (!root.isMember(name))
+    return fallback;
+  if (!root[name].isUInt() || root[name].asUInt() < minimum ||
+      root[name].asUInt() > maximum)
+    throw std::invalid_argument(std::string("invalid camera setting: ") + name);
+  return root[name].asUInt();
+}
+
 std::string FetchMediaTokenFallback(const MediaWorkerConfig &config) {
   AuthenticatedClient client(config);
   const auto response =
@@ -75,6 +85,28 @@ std::string FetchMediaTokenFallback(const MediaWorkerConfig &config) {
 
 } // namespace
 
+VideoPublishConfig ParseCameraVideoPublishConfig(const Json::Value &root) {
+  if (!root.isObject())
+    throw std::invalid_argument("camera capture configuration must be an object");
+  // Match the capture pipeline's defaults and bounds. Publish its encoded
+  // output dimensions, not the sensor's input dimensions.
+  const auto input_width = CameraNumber(root, "width", 1920, 16, 4096);
+  const auto input_height = CameraNumber(root, "height", 1080, 16, 4096);
+  VideoPublishConfig config;
+  config.width =
+      CameraNumber(root, "output_width", config.width, 16, input_width);
+  config.height =
+      CameraNumber(root, "output_height", config.height, 16, input_height);
+  config.fps = CameraNumber(root, "fps", config.fps, 1, 60);
+  config.bitrate_bps =
+      CameraNumber(root, "bitrate_bps", config.bitrate_bps, 64000, 10000000);
+  if (((input_width | input_height | config.width | config.height) & 1u) ||
+      config.width > input_width || config.height > input_height)
+    throw std::invalid_argument(
+        "camera dimensions must be even and output must fit input");
+  return config;
+}
+
 MediaWorkerConfig ParseMediaWorkerConfig(const Json::Value &root) {
   MediaWorkerConfig config;
   static_cast<AuthConfig &>(config) = ParseAuthConfig(root);
@@ -89,6 +121,15 @@ MediaWorkerConfig ParseMediaWorkerConfig(const Json::Value &root) {
       OptionalStringField(root, "camera_source", "disabled", true);
   config.camera_layout = OptionalStringField(root, "camera_layout", "single");
   config.camera_track = OptionalStringField(root, "camera_track", "camera0");
+  config.camera_capture_config =
+      OptionalStringField(root, "camera_capture_config", "", true);
+  if (!config.camera_capture_config.empty() &&
+      (config.camera_capture_config.front() != '/' ||
+       config.camera_capture_config.size() > 4096 ||
+       config.camera_capture_config.find_first_of("\r\n\t") !=
+           std::string::npos))
+    throw std::invalid_argument(
+        "camera_capture_config requires an absolute path without control characters");
   config.control_mode = OptionalStringField(root, "control_mode", "disabled");
   if (config.camera_source != "disabled" &&
       config.camera_source != "simulation" &&
@@ -129,7 +170,13 @@ MediaWorkerConfig ParseMediaWorkerConfig(const Json::Value &root) {
 }
 
 MediaWorkerConfig LoadMediaWorkerConfig(const std::string &path) {
-  return ParseMediaWorkerConfig(LoadDeviceConfigJSON(path));
+  auto config = ParseMediaWorkerConfig(LoadDeviceConfigJSON(path));
+  if (config.media_enabled && config.camera_source == "h264_annexb" &&
+      !config.camera_capture_config.empty()) {
+    config.video_publish = ParseCameraVideoPublishConfig(
+        LoadProtectedJSON(config.camera_capture_config));
+  }
+  return config;
 }
 
 } // namespace vehicle_edge
@@ -371,7 +418,9 @@ int vehicle_edge::RunMediaBackend(const MediaWorkerConfig &config) {
       std::shared_ptr<livekit::VideoSource> source;
       if (encoded) {
         auto encoded_source = std::make_shared<livekit::EncodedVideoSource>(
-            livekit::VideoCodec::H264, 640, 480);
+            livekit::VideoCodec::H264,
+            config.video_publish ? config.video_publish->width : 640,
+            config.video_publish ? config.video_publish->height : 480);
         encoded_sources.push_back(encoded_source);
         source = std::move(encoded_source);
       } else {
@@ -386,9 +435,21 @@ int vehicle_edge::RunMediaBackend(const MediaWorkerConfig &config) {
             livekit::VideoEncoderBackend::PreEncoded;
         publish_options.video_codec = livekit::VideoCodec::H264;
         publish_options.simulcast = false;
+        if (config.video_publish) {
+          const auto &video = *config.video_publish;
+          publish_options.video_encoding = livekit::VideoEncodingOptions{
+              video.bitrate_bps, static_cast<double>(video.fps)};
+        }
         publish_options.frame_metadata_features.emplace();
         publish_options.frame_metadata_features->user_timestamp = true;
         participant->publishTrack(track, publish_options);
+        if (config.video_publish) {
+          const auto &video = *config.video_publish;
+          std::cerr << "[teleop_video_publish] track=" << name
+                    << " width=" << video.width << " height=" << video.height
+                    << " max_bitrate_bps=" << video.bitrate_bps
+                    << " max_fps=" << video.fps << "\n";
+        }
       } else {
         track = participant->publishVideoTrack(
             name, source, livekit::TrackSource::SOURCE_CAMERA);
