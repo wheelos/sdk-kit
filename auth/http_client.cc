@@ -56,7 +56,6 @@ const char *RequestCategory(const std::string &path, bool oauth) {
   if (route == "/mission-status") return "mission_status";
   if (route == "/media-demand") return "media_demand";
   if (route == "/control/context") return "control_context";
-  if (route == "/control/simulation-ack") return "control_simulation_ack";
   if (route == "/data/health") return "data_health";
   if (route == "/data/profile") return "data_profile";
   if (route == "/data/diagnostics") return "data_diagnostics";

@@ -102,8 +102,8 @@ MediaWorkerConfig ParseMediaWorkerConfig(const Json::Value &root) {
     throw std::invalid_argument("invalid camera_track");
   }
   if (config.control_mode != "disabled" &&
-      config.control_mode != "simulation" && config.control_mode != "cyber") {
-    throw std::invalid_argument("invalid control_mode");
+      config.control_mode != "cyber") {
+    throw std::invalid_argument("set control_mode=disabled or cyber; simulation control was retired");
   }
   if (config.IsLocalSimDebug() && config.control_mode == "cyber") {
     throw std::invalid_argument("local_sim_debug forbids cyber control_mode");
@@ -182,8 +182,7 @@ struct ControlDelegate : livekit::RoomDelegate {
   bool enabled = false;
   std::atomic<bool> failed{false};
   explicit ControlDelegate(const vehicle_edge::MediaWorkerConfig &config)
-      : enabled(config.control_mode == "simulation" ||
-                config.control_mode == "cyber") {}
+      : enabled(config.control_mode == "cyber") {}
   void
   onUserPacketReceived(livekit::Room &,
                        const livekit::UserDataPacketEvent &event) override {
