@@ -39,6 +39,8 @@ struct EncodedFrame {
   std::int64_t timestamp_us = 0;
   // Unix microseconds at appsink read; zero means unavailable.
   std::int64_t capture_time_us = 0;
+  // Capture PTS mapped to Linux CLOCK_MONOTONIC. Zero when unavailable.
+  std::int64_t capture_monotonic_us = 0;
   bool keyframe = false;
   bool discontinuity = false;
   std::uint64_t sequence = 0;

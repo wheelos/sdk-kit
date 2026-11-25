@@ -23,6 +23,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cstring>
+#include <future>
 #include <iostream>
 #include <memory>
 #include <stdexcept>
@@ -327,6 +328,57 @@ void Drain(Update *update) {
   }
 }
 
+struct BenchClockSample {
+  std::uint32_t epoch = 0;
+  std::int64_t elapsed_ms = 0;
+  vehicle_edge::SteadyTime received{};
+};
+
+BenchClockSample SampleBenchClock(vehicle_edge::AuthenticatedClient &client,
+                                  const std::string &vehicle_id) {
+  try {
+    auto response =
+        client.Get("/api/vehicles/" + vehicle_id + "/control/bench-clock",
+                   vehicle_edge::HTTPTimeouts{500, 1000});
+    const auto received = std::chrono::steady_clock::now();
+    if (response.status == 200) {
+      const auto body = vehicle_edge::ParseHTTPJSON(response.body);
+      if (body["epoch"].isUInt() && body["elapsed_ms"].isUInt64() &&
+          body["elapsed_ms"].asUInt64() < (1ULL << 40))
+        return {body["epoch"].asUInt(), body["elapsed_ms"].asInt64(), received};
+    }
+  } catch (const std::exception &) {
+    // Camera observation continues if the authenticated clock is unavailable.
+  }
+  return {};
+}
+
+std::optional<std::array<std::uint8_t, 12>> CaptureStamp(
+    int view, const BenchClockSample &sample, vehicle_edge::SteadyTime captured) {
+  if (captured < sample.received) return std::nullopt;
+  const auto delta = std::chrono::duration_cast<std::chrono::milliseconds>(
+                         captured - sample.received)
+                         .count();
+  if (!sample.epoch || delta < 0 || delta > 15000 || view < 0 || view > 2) return std::nullopt;
+  // Sampling at HTTP receipt yields a lower bound. Allow 1000 ppm oscillator
+  // drift.
+  const auto stamp = sample.elapsed_ms + delta - (delta / 1000 + 1);
+  if (stamp < 0 || stamp >= (1LL << 40)) return std::nullopt;
+  std::array<std::uint8_t, 12> bytes{};
+  bytes[0] = 0xb0 + view;
+  for (int i = 0; i < 4; ++i) bytes[1 + i] = sample.epoch >> (24 - 8 * i);
+  for (int i = 0; i < 5; ++i) bytes[5 + i] = stamp >> (32 - 8 * i);
+  unsigned crc = 0xffff;
+  for (int i = 0; i < 10; ++i) {
+    crc ^= bytes[i] << 8;
+    for (int bit = 0; bit < 8; ++bit)
+      crc = ((crc << 1) ^ ((crc & 0x8000) ? 0x1021 : 0)) & 0xffff;
+  }
+  bytes[10] = crc >> 8;
+  bytes[11] = crc;
+  return bytes;
+}
+
 void SimulationFrame(livekit::VideoSource *source, std::uint64_t sequence,
                      int view) {
   constexpr int width = 640;
@@ -368,6 +420,7 @@ int vehicle_edge::RunMediaBackend(const MediaWorkerConfig &config) {
   signal(SIGINT, Stop);
   const bool encoded = config.camera_source == "h264_annexb";
   const bool three = config.camera_layout == "three";
+  const bool stamp_camera = encoded && three && !config.camera_capture_config.empty();
   if (!config.media_enabled ||
       (!encoded && config.camera_source != "simulation") ||
       (config.camera_layout != "single" && !three))
@@ -442,6 +495,7 @@ int vehicle_edge::RunMediaBackend(const MediaWorkerConfig &config) {
         }
         publish_options.frame_metadata_features.emplace();
         publish_options.frame_metadata_features->user_timestamp = true;
+        publish_options.frame_metadata_features->user_data = stamp_camera;
         participant->publishTrack(track, publish_options);
         if (config.video_publish) {
           const auto &video = *config.video_publish;
@@ -468,6 +522,13 @@ int vehicle_edge::RunMediaBackend(const MediaWorkerConfig &config) {
       throw std::runtime_error("media supervisor unavailable");
     std::uint64_t sequence = 0;
     auto next_frame = vehicle_edge::SteadyTime{};
+    auto next_clock = vehicle_edge::SteadyTime{};
+    std::unique_ptr<AuthenticatedClient> clock_client;
+    std::future<BenchClockSample> clock_request;
+    BenchClockSample clock_sample;
+    BenchClockSample previous_clock;
+    if (publish_video && stamp_camera)
+      clock_client = std::make_unique<AuthenticatedClient>(config);
     auto next_state = vehicle_edge::SteadyTime{};
     auto next_control = vehicle_edge::SteadyTime{};
     std::array<bool, vehicle_edge::kMaxCameraStreams> waiting_keyframe{
@@ -532,6 +593,18 @@ int vehicle_edge::RunMediaBackend(const MediaWorkerConfig &config) {
           last_control_feedback = body;
           next_control = now + std::chrono::milliseconds(50);
         }
+      }
+      if (clock_request.valid() &&
+          clock_request.wait_for(std::chrono::seconds(0)) ==
+              std::future_status::ready) {
+        previous_clock = clock_sample;
+        clock_sample = clock_request.get();
+      }
+      if (clock_client && !clock_request.valid() && now >= next_clock) {
+        clock_request =
+            std::async(std::launch::async, SampleBenchClock,
+                       std::ref(*clock_client), config.vehicle_id);
+        next_clock = now + std::chrono::seconds(8);
       }
       if (publish_video && encoded) {
         for (std::size_t cam = 0; cam < encoded_sources.size(); ++cam) {
@@ -628,6 +701,18 @@ int vehicle_edge::RunMediaBackend(const MediaWorkerConfig &config) {
             input_frame.metadata.emplace();
             input_frame.metadata->user_timestamp_us =
                 static_cast<std::uint64_t>(frame->capture_time_us);
+          }
+          if (stamp_camera && frame->capture_monotonic_us > 0 &&
+              frame->capture_monotonic_us <= clock_us) {
+            const vehicle_edge::SteadyTime captured{
+                std::chrono::microseconds(frame->capture_monotonic_us)};
+            const auto &clock = captured < clock_sample.received &&
+                                        previous_clock.epoch == clock_sample.epoch
+                                    ? previous_clock : clock_sample;
+            if (const auto stamp = CaptureStamp(cam, clock, captured)) {
+              if (!input_frame.metadata) input_frame.metadata.emplace();
+              input_frame.metadata->user_data.emplace(stamp->begin(), stamp->end());
+            }
           }
           input_frame.data = std::move(frame->data);
           if (!encoded_sources[cam]->captureFrame(input_frame)) {

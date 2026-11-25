@@ -171,6 +171,7 @@ void IPC() {
     auto frame = Frame(1);
     frame.camera_index = 2;
     frame.capture_time_us = 1700000000123456;
+    frame.capture_monotonic_us = 12345678;
     frame.discontinuity = true;
     Require(SendEncodedFrame(sockets[0], frame), "frame send failed");
     const auto received = ReceiveEncodedFrame(sockets[1]);
@@ -179,7 +180,8 @@ void IPC() {
                 received->discontinuity &&
                 received->width == 640 && received->sequence == 1 &&
                 received->camera_index == 2 &&
-                received->capture_time_us == frame.capture_time_us,
+                received->capture_time_us == frame.capture_time_us &&
+                received->capture_monotonic_us == frame.capture_monotonic_us,
             "IPC metadata or payload corrupted");
     Require(SendVideoFeedback(sockets[0], {true, 750000, 30, 0b101}),
             "video feedback send failed");
@@ -188,10 +190,11 @@ void IPC() {
                 fb->camera_mask == 0b101,
             "video feedback camera_mask corrupted");
     frame.capture_time_us = 0;
+    frame.capture_monotonic_us = 0;
     frame.discontinuity = false;
     Require(SendEncodedFrame(sockets[0], frame), "legacy frame send failed");
     const auto legacy = ReceiveEncodedFrame(sockets[1]);
-    Require(legacy && legacy->capture_time_us == 0 && !legacy->discontinuity,
+    Require(legacy && legacy->capture_time_us == 0 && legacy->capture_monotonic_us == 0 && !legacy->discontinuity,
             "frame without capture time was not preserved");
     Require(SendVideoFeedback(sockets[1], {true, 500000, 15}),
             "feedback send failed");
