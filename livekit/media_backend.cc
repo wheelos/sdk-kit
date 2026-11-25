@@ -42,19 +42,17 @@ namespace {
 std::string OptionalStringField(const Json::Value &root, const char *key,
                                 const std::string &fallback = "",
                                 bool nullable = false) {
-  if (!root.isMember(key) || (nullable && root[key].isNull()))
-    return fallback;
+  if (!root.isMember(key) || (nullable && root[key].isNull())) return fallback;
   if (!root[key].isString() || root[key].asString().empty()) {
-    throw std::invalid_argument(std::string("expected non-empty config string: ") +
-                                key);
+    throw std::invalid_argument(
+        std::string("expected non-empty config string: ") + key);
   }
   return root[key].asString();
 }
 
 bool ValidEndpointScheme(const std::string &url, const char *s1,
                          const char *s2) {
-  if (url.find(' ') != std::string::npos)
-    return false;
+  if (url.find(' ') != std::string::npos) return false;
   const bool first = url.rfind(s1, 0) == 0 && url.size() > std::strlen(s1);
   const bool second = url.rfind(s2, 0) == 0 && url.size() > std::strlen(s2);
   return first || second;
@@ -62,8 +60,7 @@ bool ValidEndpointScheme(const std::string &url, const char *s1,
 
 unsigned CameraNumber(const Json::Value &root, const char *name,
                       unsigned fallback, unsigned minimum, unsigned maximum) {
-  if (!root.isMember(name))
-    return fallback;
+  if (!root.isMember(name)) return fallback;
   if (!root[name].isUInt() || root[name].asUInt() < minimum ||
       root[name].asUInt() > maximum)
     throw std::invalid_argument(std::string("invalid camera setting: ") + name);
@@ -78,17 +75,17 @@ std::string FetchMediaTokenFallback(const MediaWorkerConfig &config) {
     throw std::runtime_error("device request rejected (HTTP " +
                              std::to_string(response.status) + ")");
   const auto json = ParseHTTPJSON(response.body);
-  if (!json["token"].isString() ||
-      !ValidBearerToken(json["token"].asString()))
+  if (!json["token"].isString() || !ValidBearerToken(json["token"].asString()))
     throw std::runtime_error("invalid media token response");
   return json["token"].asString();
 }
 
-} // namespace
+}  // namespace
 
 VideoPublishConfig ParseCameraVideoPublishConfig(const Json::Value &root) {
   if (!root.isObject())
-    throw std::invalid_argument("camera capture configuration must be an object");
+    throw std::invalid_argument(
+        "camera capture configuration must be an object");
   // Match the capture pipeline's defaults and bounds. Publish its encoded
   // output dimensions, not the sensor's input dimensions.
   const auto input_width = CameraNumber(root, "width", 1920, 16, 4096);
@@ -130,7 +127,8 @@ MediaWorkerConfig ParseMediaWorkerConfig(const Json::Value &root) {
        config.camera_capture_config.find_first_of("\r\n\t") !=
            std::string::npos))
     throw std::invalid_argument(
-        "camera_capture_config requires an absolute path without control characters");
+        "camera_capture_config requires an absolute path without control "
+        "characters");
   config.control_mode = OptionalStringField(root, "control_mode", "disabled");
   if (config.camera_source != "disabled" &&
       config.camera_source != "simulation" &&
@@ -143,9 +141,9 @@ MediaWorkerConfig ParseMediaWorkerConfig(const Json::Value &root) {
   if (!ValidIdentifier(config.camera_track)) {
     throw std::invalid_argument("invalid camera_track");
   }
-  if (config.control_mode != "disabled" &&
-      config.control_mode != "cyber") {
-    throw std::invalid_argument("set control_mode=disabled or cyber; simulation control was retired");
+  if (config.control_mode != "disabled" && config.control_mode != "cyber") {
+    throw std::invalid_argument(
+        "set control_mode=disabled or cyber; simulation control was retired");
   }
   if (config.IsLocalSimDebug() && config.control_mode == "cyber") {
     throw std::invalid_argument("local_sim_debug forbids cyber control_mode");
@@ -156,12 +154,11 @@ MediaWorkerConfig ParseMediaWorkerConfig(const Json::Value &root) {
       throw std::invalid_argument(
           "media requires livekit_url and active camera_source");
     }
-    const auto endpoint =
-        config.livekit_url.rfind("wss://", 0) == 0
-            ? "https://" + config.livekit_url.substr(6)
-            : (config.livekit_url.rfind("ws://", 0) == 0
-                   ? "http://" + config.livekit_url.substr(5)
-                   : "");
+    const auto endpoint = config.livekit_url.rfind("wss://", 0) == 0
+                              ? "https://" + config.livekit_url.substr(6)
+                              : (config.livekit_url.rfind("ws://", 0) == 0
+                                     ? "http://" + config.livekit_url.substr(5)
+                                     : "");
     if (config.IsLocalSimDebug() && !LoopbackURL(endpoint)) {
       throw std::invalid_argument(
           "local_sim_debug requires loopback livekit_url");
@@ -180,7 +177,7 @@ MediaWorkerConfig LoadMediaWorkerConfig(const std::string &path) {
   return config;
 }
 
-} // namespace vehicle_edge
+}  // namespace vehicle_edge
 
 namespace {
 
@@ -213,8 +210,7 @@ std::optional<std::string> EncodeRTCState(const Json::Value &snapshot,
       encoded = EncodeJSON(packet);
     }
   }
-  if (encoded.size() > 12000)
-    return std::nullopt;
+  if (encoded.size() > 12000) return std::nullopt;
   return encoded;
 }
 
@@ -231,16 +227,14 @@ struct ControlDelegate : livekit::RoomDelegate {
   std::atomic<bool> failed{false};
   explicit ControlDelegate(const vehicle_edge::MediaWorkerConfig &config)
       : enabled(config.control_mode == "cyber") {}
-  void
-  onUserPacketReceived(livekit::Room &,
-                       const livekit::UserDataPacketEvent &event) override {
+  void onUserPacketReceived(
+      livekit::Room &, const livekit::UserDataPacketEvent &event) override {
     if (!enabled || event.topic != "vehicle.control.v2" ||
         (event.kind != livekit::DataPacketKind::Reliable &&
          event.kind != livekit::DataPacketKind::Lossy) ||
         !event.participant)
       return;
-    if (event.data.size() > 2048)
-      return;
+    if (event.data.size() > 2048) return;
     Json::Value packet;
     packet["sender"] = event.participant->identity();
     packet["body"] = std::string(event.data.begin(), event.data.end());
@@ -272,13 +266,14 @@ bool Authorized(const Update &update) {
          std::chrono::steady_clock::now() < update.deadline;
 }
 
-bool Receive(Update *update, bool wait, bool watch_video = false) {
+bool Receive(Update *update, bool wait, bool watch_video = false,
+             int timeout_ms = 20) {
   pollfd descriptors[2]{
       {3, POLLIN, 0},
       {4, static_cast<short>(watch_video ? POLLIN : 0), 0},
   };
   const nfds_t descriptor_count = watch_video ? 2 : 1;
-  if (poll(descriptors, descriptor_count, wait ? 20 : 0) <= 0 ||
+  if (poll(descriptors, descriptor_count, wait ? timeout_ms : 0) <= 0 ||
       !(descriptors[0].revents & (POLLIN | POLLHUP | POLLERR)))
     return false;
   char buffer[65537];
@@ -328,6 +323,8 @@ void Drain(Update *update) {
   }
 }
 
+// The generated-camera bench writes the Gateway clock into the displayed
+// pixels.
 struct BenchClockSample {
   std::uint32_t epoch = 0;
   std::int64_t elapsed_ms = 0;
@@ -379,17 +376,33 @@ std::optional<std::array<std::uint8_t, 12>> CaptureStamp(
   return bytes;
 }
 
-void SimulationFrame(livekit::VideoSource *source, std::uint64_t sequence,
-                     int view) {
-  constexpr int width = 640;
-  constexpr int height = 480;
-  auto frame = livekit::VideoFrame::create(width, height,
-                                           livekit::VideoBufferType::RGBA);
-  auto *pixels = frame.data();
+void StampGeneratedFrame(std::uint8_t *pixels, int width, int view,
+                         const BenchClockSample &sample,
+                         vehicle_edge::SteadyTime generated) {
+  const auto stamp = CaptureStamp(view, sample, generated);
+  if (!stamp) return;
+  const auto &bytes = *stamp;
+  for (int bit = 0; bit < 96; ++bit) {
+    const auto value = bytes[bit / 8] & (0x80 >> (bit % 8)) ? 240 : 16;
+    for (int y = 0; y < 16; ++y)
+      for (int x = bit * 6; x < (bit + 1) * 6; ++x)
+        std::fill_n(pixels + (y * width + x) * 4, 3, value);
+  }
+}
+
+constexpr int generated_width = 640;
+constexpr int generated_height = 480;
+constexpr int generated_stride = generated_width + 80;
+
+// Store one extra stripe period so each frame is a shifted row copy.
+std::vector<std::uint8_t> StripePattern(int view) {
+  constexpr int stride = generated_stride;
+  constexpr int height = generated_height;
+  std::vector<std::uint8_t> pixels(stride * height * 4);
   for (int y = 0; y < height; ++y) {
-    for (int x = 0; x < width; ++x) {
-      const auto offset = (y * width + x) * 4;
-      const bool stripe = (x + static_cast<int>(sequence % width)) % 80 < 40;
+    for (int x = 0; x < stride; ++x) {
+      const auto offset = (y * stride + x) * 4;
+      const bool stripe = x % 80 < 40;
       pixels[offset] = stripe ? 220 : 30;
       pixels[offset + 1] = static_cast<std::uint8_t>(y * 255 / height);
       pixels[offset + 2] = stripe ? 30 : 220;
@@ -405,10 +418,28 @@ void SimulationFrame(livekit::VideoSource *source, std::uint64_t sequence,
       pixels[offset + 3] = 255;
     }
   }
+  return pixels;
+}
+
+void SimulationFrame(livekit::VideoSource *source, std::uint64_t sequence,
+                     int view, const std::vector<std::uint8_t> &pattern,
+                     const BenchClockSample &sample) {
+  constexpr int width = generated_width;
+  constexpr int height = generated_height;
+  const auto generated = std::chrono::steady_clock::now();
+  auto frame = livekit::VideoFrame::create(width, height,
+                                           livekit::VideoBufferType::RGBA);
+  auto *pixels = frame.data();
+  const int shift = sequence % 80;
+  for (int y = 0; y < height; ++y) {
+    std::memcpy(pixels + y * width * 4,
+                pattern.data() + (y * generated_stride + shift) * 4, width * 4);
+  }
+  StampGeneratedFrame(pixels, width, view, sample, generated);
   source->captureFrame(frame);
 }
 
-} // namespace
+}  // namespace
 
 int vehicle_edge::RunMediaBackend(const MediaWorkerConfig &config) {
   const auto parent = getppid();
@@ -429,15 +460,13 @@ int vehicle_edge::RunMediaBackend(const MediaWorkerConfig &config) {
   update.vehicle_id = config.vehicle_id;
   while (!stopping && !Receive(&update, true, false)) {
   }
-  if (!Authorized(update))
-    return 0;
+  if (!Authorized(update)) return 0;
   std::string token = update.media_token;
   if (token.empty()) {
     token = FetchMediaTokenFallback(config);
   }
   Drain(&update);
-  if (!Authorized(update))
-    return 0;
+  if (!Authorized(update)) return 0;
   // SDK diagnostics are suppressed: upstream transport errors may contain URLs.
   SDKLifetime sdk;
   {
@@ -455,8 +484,7 @@ int vehicle_edge::RunMediaBackend(const MediaWorkerConfig &config) {
       return 0;
     }
     const auto participant = room.localParticipant().lock();
-    if (!participant)
-      throw std::runtime_error("RTC participant unavailable");
+    if (!participant) throw std::runtime_error("RTC participant unavailable");
     const bool publish_video = update.video_required;
     std::vector<std::shared_ptr<livekit::EncodedVideoSource>> encoded_sources;
     std::vector<std::shared_ptr<livekit::VideoSource>> sources;
@@ -467,6 +495,7 @@ int vehicle_edge::RunMediaBackend(const MediaWorkerConfig &config) {
             : (three ? std::vector<std::string>{"camera-left", "camera-center",
                                                 "camera-right"}
                      : std::vector<std::string>{config.camera_track});
+    std::vector<std::vector<std::uint8_t>> patterns;
     for (const auto &name : names) {
       std::shared_ptr<livekit::VideoSource> source;
       if (encoded) {
@@ -505,11 +534,16 @@ int vehicle_edge::RunMediaBackend(const MediaWorkerConfig &config) {
                     << " max_fps=" << video.fps << "\n";
         }
       } else {
-        track = participant->publishVideoTrack(
-            name, source, livekit::TrackSource::SOURCE_CAMERA);
+        track = livekit::LocalVideoTrack::createLocalVideoTrack(name, source);
+        livekit::TrackPublishOptions options;
+        options.source = livekit::TrackSource::SOURCE_CAMERA;
+        options.simulcast = false;
+        options.video_encoding = livekit::VideoEncodingOptions{1500000, 30.0};
+        participant->publishTrack(track, options);
+        patterns.push_back(
+            StripePattern(three ? static_cast<int>(patterns.size()) : -1));
       }
-      if (!track)
-        throw std::runtime_error("RTC video publication failed");
+      if (!track) throw std::runtime_error("RTC video publication failed");
       sources.push_back(std::move(source));
       tracks.push_back(std::move(track));
       Drain(&update);
@@ -522,12 +556,13 @@ int vehicle_edge::RunMediaBackend(const MediaWorkerConfig &config) {
       throw std::runtime_error("media supervisor unavailable");
     std::uint64_t sequence = 0;
     auto next_frame = vehicle_edge::SteadyTime{};
+    constexpr auto frame_period = std::chrono::nanoseconds(1000000000 / 30);
     auto next_clock = vehicle_edge::SteadyTime{};
     std::unique_ptr<AuthenticatedClient> clock_client;
     std::future<BenchClockSample> clock_request;
     BenchClockSample clock_sample;
     BenchClockSample previous_clock;
-    if (publish_video && stamp_camera)
+    if (publish_video && three && (!encoded || stamp_camera))
       clock_client = std::make_unique<AuthenticatedClient>(config);
     auto next_state = vehicle_edge::SteadyTime{};
     auto next_control = vehicle_edge::SteadyTime{};
@@ -535,7 +570,8 @@ int vehicle_edge::RunMediaBackend(const MediaWorkerConfig &config) {
         true, true, true};
     std::array<std::int64_t, vehicle_edge::kMaxCameraStreams> last_pts{0, 0, 0};
     std::array<std::int64_t, vehicle_edge::kMaxCameraStreams> base_pts{0, 0, 0};
-    std::array<std::int64_t, vehicle_edge::kMaxCameraStreams> base_time{0, 0, 0};
+    std::array<std::int64_t, vehicle_edge::kMaxCameraStreams> base_time{0, 0,
+                                                                        0};
     std::array<std::int64_t, vehicle_edge::kMaxCameraStreams> last_output_time{
         0, 0, 0};
     std::string last_control_feedback;
@@ -549,11 +585,9 @@ int vehicle_edge::RunMediaBackend(const MediaWorkerConfig &config) {
       if (conn_state == livekit::ConnectionState::Disconnected)
         throw std::runtime_error("RTC disconnected");
       Drain(&update);
-      if (!Authorized(update))
-        break;
+      if (!Authorized(update)) break;
       const auto now = std::chrono::steady_clock::now();
-      if (control.failed)
-        throw std::runtime_error("control IPC unavailable");
+      if (control.failed) throw std::runtime_error("control IPC unavailable");
       if (conn_state == livekit::ConnectionState::Reconnecting) {
         if (!was_reconnecting) {
           was_reconnecting = true;
@@ -570,8 +604,7 @@ int vehicle_edge::RunMediaBackend(const MediaWorkerConfig &config) {
                count < static_cast<int>(vehicle_edge::kMaxCameraStreams * 4) &&
                Authorized(update);
                ++count) {
-            if (!vehicle_edge::ReceiveEncodedFrame(4))
-              break;
+            if (!vehicle_edge::ReceiveEncodedFrame(4)) break;
           }
         }
         Receive(&update, true, publish_video && encoded);
@@ -624,8 +657,7 @@ int vehicle_edge::RunMediaBackend(const MediaWorkerConfig &config) {
           }
         }
         if (feedback.keyframe_requested || feedback.target_bitrate_bps) {
-          if (vehicle_edge::SendVideoFeedback(4, feedback))
-            feedback = {};
+          if (vehicle_edge::SendVideoFeedback(4, feedback)) feedback = {};
         }
         // Bound work per supervisor iteration, even if a producer floods IPC.
         for (int count = 0;
@@ -633,8 +665,7 @@ int vehicle_edge::RunMediaBackend(const MediaWorkerConfig &config) {
              Authorized(update);
              ++count) {
           auto frame = vehicle_edge::ReceiveEncodedFrame(4);
-          if (!frame)
-            break;
+          if (!frame) break;
           if (frame->camera_index >= encoded_sources.size()) {
             feedback.keyframe_requested = true;
             continue;
@@ -677,8 +708,9 @@ int vehicle_edge::RunMediaBackend(const MediaWorkerConfig &config) {
           auto elapsed_us = frame->timestamp_us - base_pts[cam];
           if (elapsed_us > clock_us - base_time[cam] + 500000 ||
               clock_us - base_time[cam] - elapsed_us > 500000) {
-            // Self-heal single-camera PTS drift or >500ms hardware stall without
-            // tearing down sibling cameras or the DataChannel control worker.
+            // Self-heal single-camera PTS drift or >500ms hardware stall
+            // without tearing down sibling cameras or the DataChannel control
+            // worker.
             if (frame->keyframe) {
               base_pts[cam] = frame->timestamp_us;
               base_time[cam] = std::max(clock_us, last_output_time[cam] + 1);
@@ -725,15 +757,16 @@ int vehicle_edge::RunMediaBackend(const MediaWorkerConfig &config) {
         ++sequence;
         for (std::size_t view = 0; view < sources.size(); ++view) {
           Drain(&update);
-          if (!Authorized(update))
-            break;
+          if (!Authorized(update)) break;
           SimulationFrame(sources[view].get(), sequence,
-                          three ? static_cast<int>(view) : -1);
+                          three ? static_cast<int>(view) : -1, patterns[view],
+                          clock_sample);
         }
-        next_frame = now + std::chrono::milliseconds(100);
+        if (next_frame == vehicle_edge::SteadyTime{}) next_frame = now;
+        const auto elapsed = std::chrono::steady_clock::now() - next_frame;
+        next_frame += frame_period * (elapsed / frame_period + 1);
       }
-      if (!Authorized(update))
-        break;
+      if (!Authorized(update)) break;
       if (now >= next_state) {
         const auto data = EncodeRTCState(update.snapshot, update.sources);
         if (data)
@@ -742,10 +775,17 @@ int vehicle_edge::RunMediaBackend(const MediaWorkerConfig &config) {
               "vehicle.state");
         next_state = now + std::chrono::milliseconds(200);
       }
-      Receive(&update, true, publish_video && encoded);
+      const int wait_ms =
+          publish_video && !encoded
+              ? std::clamp<int>(
+                    std::chrono::ceil<std::chrono::milliseconds>(
+                        next_frame - std::chrono::steady_clock::now())
+                        .count(),
+                    0, 20)
+              : 20;
+      Receive(&update, true, publish_video && encoded, wait_ms);
     }
-    for (const auto &track : tracks)
-      participant->unpublishTrack(track->sid());
+    for (const auto &track : tracks) participant->unpublishTrack(track->sid());
     tracks.clear();
     sources.clear();
     encoded_sources.clear();
