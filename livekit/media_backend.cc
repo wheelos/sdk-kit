@@ -25,6 +25,7 @@
 #include <cstring>
 #include <future>
 #include <iostream>
+#include <map>
 #include <memory>
 #include <stdexcept>
 #include <string>
@@ -34,6 +35,7 @@
 #include <livekit/livekit.h>
 
 #include "vehicle_edge/auth_client.h"
+#include "vehicle_edge/corridor_packet.h"
 #include "vehicle_edge/encoded_video.h"
 
 namespace vehicle_edge {
@@ -255,6 +257,7 @@ struct Update {
   Json::Value snapshot;
   Json::Value sources;
   Json::Value control_feedback;
+  Json::Value corridors;
   vehicle_edge::SteadyTime deadline{};
   Json::UInt64 generation = 0;
   bool video_required = true;
@@ -315,6 +318,7 @@ bool Receive(Update *update, bool wait, bool watch_video = false,
   update->snapshot = value["snapshot"];
   update->sources = value["sources"];
   update->control_feedback = value["control_feedback"];
+  update->corridors = value["corridors"];
   return true;
 }
 
@@ -496,6 +500,8 @@ int vehicle_edge::RunMediaBackend(const MediaWorkerConfig &config) {
                                                 "camera-right"}
                      : std::vector<std::string>{config.camera_track});
     std::vector<std::vector<std::uint8_t>> patterns;
+    std::map<std::string, std::uint64_t> corridor_sequence;
+    std::string corridor_stream;
     for (const auto &name : names) {
       std::shared_ptr<livekit::VideoSource> source;
       if (encoded) {
@@ -767,6 +773,40 @@ int vehicle_edge::RunMediaBackend(const MediaWorkerConfig &config) {
         next_frame += frame_period * (elapsed / frame_period + 1);
       }
       if (!Authorized(update)) break;
+      if (publish_video && update.video_required && update.corridors.isArray() &&
+          update.corridors.size() <= names.size() &&
+          update.snapshot["stream_id"].isString()) {
+        const auto stream = update.snapshot["stream_id"].asString();
+        if (stream != corridor_stream) {
+          corridor_sequence.clear();
+          corridor_stream = stream;
+        }
+        const auto now_ns =
+            std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::steady_clock::now().time_since_epoch())
+                .count();
+        for (const auto &envelope : update.corridors) {
+          vehicle_edge::CorridorPacket packet;
+          if (!vehicle_edge::ParseCorridorPacket(
+                  envelope, config.vehicle_id,
+                  stream, now_ns, &packet) ||
+              std::find(names.begin(), names.end(), packet.track) == names.end() ||
+              packet.sequence <= corridor_sequence[packet.track]) {
+            continue;
+          }
+          corridor_sequence[packet.track] = packet.sequence;
+          const auto deadline = vehicle_edge::SteadyTime(
+              std::chrono::nanoseconds(envelope["deadline_ns"].asInt64()));
+          for (const auto &payload : packet.payloads) {
+            if (!Authorized(update) ||
+                std::chrono::steady_clock::now() >= deadline)
+              break;
+            participant->publishData(
+                std::vector<std::uint8_t>(payload.begin(), payload.end()),
+                false, {}, "vehicle.corridor.v1");
+          }
+        }
+      }
       if (now >= next_state) {
         const auto data = EncodeRTCState(update.snapshot, update.sources);
         if (data)

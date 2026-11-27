@@ -3,6 +3,17 @@ load("@rules_cc//cc:defs.bzl", "cc_binary", "cc_library")
 package(default_visibility = ["//visibility:public"])
 
 cc_library(
+    name = "corridor_packet",
+    srcs = ["corridor_packet.cc"],
+    hdrs = ["include/vehicle_edge/corridor_packet.h"],
+    includes = ["include"],
+    deps = [
+        "//auth:vehicle_auth_sdk",
+        "@jsoncpp//:jsoncpp",
+    ],
+)
+
+cc_library(
     name = "encoded_video",
     srcs = ["encoded_video.cc"],
     hdrs = ["include/vehicle_edge/encoded_video.h"],
@@ -24,6 +35,7 @@ cc_library(
         "@platforms//os:linux",
     ],
     deps = [
+        ":corridor_packet",
         ":encoded_video",
         "//auth:vehicle_auth_sdk",
         "@jsoncpp//:jsoncpp",
